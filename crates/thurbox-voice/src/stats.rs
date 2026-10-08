@@ -22,7 +22,21 @@ pub struct Entry {
     /// The clip's file, when it was saved or read from one — what lets two
     /// engines' lines about the same audio be put side by side.
     pub clip: Option<String>,
+    /// The final text: cleaned when cleanup ran and was accepted.
     pub text: String,
+    /// The speech engine's own text, when a cleanup pass ran after it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup: Option<CleanupLog>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct CleanupLog {
+    pub backend: String,
+    pub secs: f64,
+    /// Why the guard refused the output, when it did.
+    pub rejected: Option<String>,
 }
 
 pub fn append(root: &Path, entry: &Entry) -> Result<()> {
@@ -70,6 +84,31 @@ pub fn print(root: &Path) -> Result<()> {
                 0.0
             },
         );
+    }
+
+    let mut by_backend: BTreeMap<&str, Vec<&CleanupLog>> = BTreeMap::new();
+    for log in by_engine
+        .values()
+        .flatten()
+        .filter_map(|e| e.cleanup.as_ref())
+    {
+        by_backend.entry(&log.backend).or_default().push(log);
+    }
+    if !by_backend.is_empty() {
+        println!();
+        println!(
+            "{:<40} {:>5} {:>12} {:>9}",
+            "cleanup", "runs", "median time", "rejected"
+        );
+        for (backend, logs) in &by_backend {
+            println!(
+                "{:<40} {:>5} {:>11.2}s {:>9}",
+                backend,
+                logs.len(),
+                median(logs.iter().map(|l| l.secs)),
+                logs.iter().filter(|l| l.rejected.is_some()).count(),
+            );
+        }
     }
     Ok(())
 }

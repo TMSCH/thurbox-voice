@@ -53,6 +53,44 @@ thurbox-voice stats
   directory, recording the engine, the trimmed audio length, the load and
   inference times, and the text.
 
+## Cleanup pass
+
+Speech models mishear jargon ("cargo next test"). An optional second pass has
+an LLM fix misheard words, using whatever context it is given, before the text
+is pasted. It is on by default once a backend is reachable. `--raw` skips it.
+
+```toml
+# ~/.config/thurbox-voice/config.toml (`thurbox-voice config` prints the path)
+[cleanup]
+enabled = true
+backend = "auto"          # "auto" | "anthropic" | "openai" | "agent"
+
+[cleanup.anthropic]       # key from ANTHROPIC_API_KEY
+model = "claude-haiku-4-5"
+
+[cleanup.openai]          # any OpenAI-compatible endpoint, key from OPENAI_API_KEY
+model = "your-model-id"
+base_url = "https://api.openai.com/v1"   # or http://localhost:11434/v1 (Ollama): fully local
+
+[cleanup.agent]           # headless agent CLI, reusing its login (slow, ~4-5 s)
+command = ["codex", "exec", "--skip-git-repo-check"]
+```
+
+- **Choosing a backend.** `auto` follows `--agent`: `claude` prefers Anthropic,
+  `codex` prefers OpenAI. When neither key is set, it falls back to that
+  agent's own CLI (`claude -p --model haiku`, `codex exec`, `gemini -p`,
+  `opencode run`).
+- **Refused outputs.** If the cleaned text drifts too far from the raw
+  transcript (length or shared words), it is refused and the raw text is kept.
+  This is how an output that *answers* the dictation, instead of correcting it,
+  is caught.
+
+```bash
+thurbox-voice cleanup --agent codex "run cargo next test"   # text only, no audio
+thurbox-voice test --file clip.wav --agent claude --context-file ctx.txt
+thurbox-voice stats                                          # adds per-backend cleanup timings
+```
+
 ## Attribution
 
 Parakeet TDT 0.6B v3 © NVIDIA, licensed under

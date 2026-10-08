@@ -1,10 +1,13 @@
 //! thurbox-voice: local dictation for thurbox.
 //!
-//! This is the phase-0 spike: a plain CLI to record or read a clip and
-//! transcribe it with Parakeet or Whisper, logging timings so the two can be
-//! compared on real prompts. The daemon and the thurbox pane come later.
+//! This is the phase-0 spike: a plain CLI to record or read a clip, transcribe
+//! it with Parakeet or Whisper, optionally have an LLM fix misheard words, and
+//! log timings so engines and cleanup backends can be compared on real
+//! prompts. The daemon and the thurbox pane come later.
 
 mod audio;
+mod cleanup;
+mod config;
 mod engine;
 mod models;
 mod stats;
@@ -13,8 +16,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Result};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
+use config::Backend;
 use engine::{Engine, EngineId};
 
 #[derive(Parser)]
@@ -47,9 +51,83 @@ enum Command {
         /// Words to bias Whisper towards, e.g. "thurbox, kubectl, Spotpay".
         #[arg(long)]
         vocabulary: Option<String>,
+        #[command(flatten)]
+        cleanup: CleanupArgs,
     },
-    /// Summarise compare.jsonl per engine.
+    /// Run only the cleanup pass over some text — iterate on it without audio.
+    Cleanup {
+        /// The transcript to clean up.
+        text: String,
+        #[command(flatten)]
+        cleanup: CleanupArgs,
+    },
+    /// Show where the config file is and which cleanup backend would be used.
+    Config,
+    /// Summarise compare.jsonl per engine and per cleanup backend.
     Stats,
+}
+
+#[derive(Args)]
+struct CleanupArgs {
+    /// Skip the cleanup pass, whatever the config says.
+    #[arg(long)]
+    raw: bool,
+    /// Override `[cleanup] backend`.
+    #[arg(long, value_enum)]
+    backend: Option<Backend>,
+    /// The coding agent the text is for (claude, codex, …) — what `auto`
+    /// follows, and which agent CLI the `agent` backend runs.
+    #[arg(long)]
+    agent: Option<String>,
+    /// A file of context for the cleanup model: repo and branch names, the
+    /// agent's last screen, a glossary. Names in it win over near-misses.
+    #[arg(long)]
+    context_file: Option<PathBuf>,
+}
+
+impl CleanupArgs {
+    /// `None` when cleanup is off for this run.
+    fn plan(&self, config: &config::Config) -> Result<Option<Plan>> {
+        if self.raw || !config.cleanup.enabled {
+            return Ok(None);
+        }
+        let context = match &self.context_file {
+            Some(path) => Some(
+                std::fs::read_to_string(path)
+                    .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?,
+            ),
+            None => None,
+        };
+        Ok(Some(Plan {
+            backend: self.backend.unwrap_or(config.cleanup.backend),
+            agent: self.agent.clone(),
+            context,
+        }))
+    }
+}
+
+struct Plan {
+    backend: Backend,
+    agent: Option<String>,
+    context: Option<String>,
+}
+
+impl Plan {
+    fn run(&self, config: &config::Config, raw: &str) -> Result<cleanup::Cleaned> {
+        let cleaned = cleanup::run(
+            &config.cleanup,
+            self.backend,
+            self.agent.as_deref(),
+            self.context.as_deref(),
+            raw,
+        )?;
+        eprintln!("[cleanup] {} · {:.2}s", cleaned.backend, cleaned.secs);
+        if let Some(why) = &cleaned.rejected {
+            eprintln!("[cleanup] ignored ({why}) — keeping the raw transcript. Model said:");
+            eprintln!("{}", cleaned.model_output);
+        }
+        Ok(cleaned)
+    }
 }
 
 /// `$THURBOX_VOICE_HOME`, else `$XDG_DATA_HOME/thurbox-voice`, else
@@ -74,6 +152,7 @@ fn main() -> Result<()> {
     // ours.
     whisper_rs::install_logging_hooks();
     let root = data_root();
+    let config = config::load()?;
     match cli.command {
         Command::Models => {
             let models_root = root.join("models");
@@ -106,13 +185,50 @@ fn main() -> Result<()> {
             file,
             save,
             vocabulary,
-        } => test(&root, &engines, file, save, vocabulary.as_deref()),
+            cleanup,
+        } => {
+            let plan = cleanup.plan(&config)?;
+            test(
+                &root,
+                &config,
+                plan.as_ref(),
+                &engines,
+                file,
+                save,
+                vocabulary.as_deref(),
+            )
+        }
+        Command::Cleanup { text, cleanup } => {
+            let plan = cleanup.plan(&config)?.unwrap_or(Plan {
+                backend: cleanup.backend.unwrap_or(config.cleanup.backend),
+                agent: cleanup.agent.clone(),
+                context: None,
+            });
+            let cleaned = plan.run(&config, &text)?;
+            println!("{}", cleaned.text);
+            Ok(())
+        }
+        Command::Config => {
+            let path = config::path();
+            let state = if path.exists() {
+                ""
+            } else {
+                " (absent — defaults in use)"
+            };
+            println!("config: {}{state}", path.display());
+            println!("data:   {}", root.display());
+            println!("cleanup enabled: {}", config.cleanup.enabled);
+            println!("cleanup backend: {:?}", config.cleanup.backend);
+            Ok(())
+        }
         Command::Stats => stats::print(&root),
     }
 }
 
 fn test(
     root: &Path,
+    config: &config::Config,
+    plan: Option<&Plan>,
     engines: &[EngineId],
     file: Option<PathBuf>,
     save: Option<PathBuf>,
@@ -169,7 +285,32 @@ fn test(
             infer.as_secs_f64(),
             audio_s / infer.as_secs_f64().max(1e-6)
         );
-        println!("{text}");
+        let (text, raw, cleanup) = match plan {
+            None => {
+                println!("{text}");
+                (text, None, None)
+            }
+            Some(plan) => {
+                println!("raw:     {text}");
+                // A failed cleanup is reported, not fatal: the raw text is
+                // still a usable dictation.
+                match plan.run(config, &text) {
+                    Ok(cleaned) => {
+                        println!("cleaned: {}", cleaned.text);
+                        let log = stats::CleanupLog {
+                            backend: cleaned.backend,
+                            secs: cleaned.secs,
+                            rejected: cleaned.rejected,
+                        };
+                        (cleaned.text, Some(text), Some(log))
+                    }
+                    Err(e) => {
+                        eprintln!("[cleanup] failed: {e:#}");
+                        (text, None, None)
+                    }
+                }
+            }
+        };
         stats::append(
             root,
             &stats::Entry {
@@ -184,6 +325,8 @@ fn test(
                 chars: text.chars().count(),
                 clip: clip_name.clone(),
                 text,
+                raw,
+                cleanup,
             },
         )?;
     }
