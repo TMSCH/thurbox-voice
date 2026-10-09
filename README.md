@@ -1,196 +1,194 @@
 # thurbox-voice
 
-Local dictation for [thurbox](https://github.com/Thurbeen/thurbox): speak a
-prompt and it is transcribed **on your machine**. No audio leaves it.
+Dictate prompts into [thurbox](https://github.com/Thurbeen/thurbox) sessions.
+Press `ctrl+space`, talk, press it again: the text lands in the selected
+session's input box, **unsubmitted**, for you to read and send. Speech is
+transcribed on your machine; the audio never leaves it.
+
+![Dictating into a thurbox session: select it, ctrl+space, talk, ctrl+space, and the text waits in opencode's input box](media/demo.gif)
+
+<sub>A real take, re-recorded with [`demo/record.sh`](demo/record.sh): thurbox
+v2.56.1 on Linux, Parakeet, cleanup off. The voice is espeak-ng, played into a
+virtual microphone, so the take is the same every run.</sub>
 
 **Status: early.** It works end to end; expect rough edges.
 
-## Use it in thurbox
+## Set it up
 
-`ctrl+space` starts recording for the selected session, and `ctrl+space` again
-stops it. The text is pasted into that session's input box **without being
-submitted**, so you read it and press Enter yourself.
-
-A one-line strip above the bars is always there, so nothing moves when you
-start or stop. It shows one of:
-
-- `○ ctrl+space to start talking → <session>` when idle;
-- `● REC 0:07 → <session>` while recording;
-- `⋯ transcribing`, then the outcome for a few seconds.
+You need thurbox **v2.56.0 or later**, Rust, and `cmake` (whisper.cpp builds
+with it: `brew install cmake` on macOS). On Linux the audio crate also needs
+`pkg-config` and the ALSA headers (`libasound2-dev`, or `alsa-lib` on Arch).
 
 ```bash
-# 1. The helper (needs Rust and cmake: `brew install cmake`)
+# 1. The helper, and the default speech model (671 MB)
 git clone https://github.com/TMSCH/thurbox-voice && cd thurbox-voice
-cargo install --path crates/thurbox-voice
-thurbox-voice pull parakeet              # 671 MB; `pull whisper` for the other engine
+cargo install --locked --path crates/thurbox-voice
+thurbox-voice pull parakeet
 
 # 2. The pane
 thurbox-cli plugin install git+https://github.com/TMSCH/thurbox-voice
-# then in thurbox: Ctrl+,  →  ]  →  select "voice"  →  t   (trust it to run programs)
+thurbox-cli plugin check
 ```
 
-**3. The strip places itself.** The pane declares itself a strip, and
-thurbox places strips above the bars on its own
-([Thurbeen/thurbox#1370](https://github.com/Thurbeen/thurbox/pull/1370)).
-That takes two rows: the voice line, then a gap.
+3. **Let it run the helper.** In thurbox: `Ctrl+,` → `]` → select `voice` →
+   `t`. Until then the strip says `voice needs trust`.
+4. **Placement is automatic.** The pane is a *strip*, and thurbox's shipped
+   layout puts strips above the bars on its own: two rows, the voice line and a
+   gap. If your `~/.config/thurbox/ui/layout.lua` is customised and predates
+   strips, `thurbox-cli plugin check` says so. Add this once, before the
+   message band (`if status_rows() > 0 then`):
 
-If your `~/.config/thurbox/ui/layout.lua` is customised and predates strips,
-`thurbox-cli plugin check` will say so. Add this once, before the message band
-(`if status_rows() > 0 then`):
+   ```lua
+   for _, strip in ipairs(ctx.strips or {}) do
+     children[#children + 1] = { slot = strip.slot, len = strip.len }
+   end
+   ```
 
-```lua
-for _, strip in ipairs(ctx.strips or {}) do
-  children[#children + 1] = { slot = strip.slot, len = strip.len }
-end
-```
+The helper always runs on the machine running thurbox, where the microphone
+is, even when the session lives on a remote host.
 
-**Requires** a thurbox with `run(…, { machine = "local" })`
-([Thurbeen/thurbox#1369](https://github.com/Thurbeen/thurbox/pull/1369)), so the helper
-runs on your machine (where the microphone is), even for a remote session.
+## Use it
 
-**In the palette** (`Ctrl+P`):
+| Strip | Means |
+|---|---|
+| `○ ctrl+space to start talking → fix-ci` | idle; the arrow names the selected session |
+| `● REC 0:07 → fix-ci · parakeet · ctrl+space to stop` | recording for that session |
+| `⋯ transcribing for fix-ci…` | speech to text, then cleanup |
+| `✓ dictated 66 chars → fix-ci — review, then Enter` | in the input box, not sent |
 
-- `voice: cancel the recording`
-- `voice: switch speech engine`
+The session is fixed when you start: change the selection mid-sentence and the
+text still goes where you started. Nothing is ever submitted for you.
 
-**In settings** (`Ctrl+,`): `voice.engine`.
-
-**Behind the key** is a daemon (`thurbox-voice start/stop/cancel/status/quit`).
-It keeps the model loaded between dictations and exits after
-`[voice] unload_after_secs` (default 600) of idle time. Its log is `daemon.log`
-in the data directory.
-
-## Architecture
-
-```text
-microphone ─▶ speech-to-text ─▶ LLM cleanup ─▶ thurbox session input
-   cpal        Parakeet or        + context      thurbox-cli session send
-               Whisper, local                    --no-enter
-```
-
-A daemon holds the microphone and the loaded model. On `start` it records
-through `cpal`, resampled to 16 kHz mono. On `stop` it transcribes on your
-machine with the selected engine: Parakeet TDT (ONNX) or Whisper
-(whisper.cpp), both run through transcribe-rs. The transcript then goes to an
-LLM that fixes misheard words, and only those. It is given the built-in word
-list, your glossary, and the target session's name, repo, branch and agent,
-plus the last ~60 lines of its screen. A guard keeps the raw text if the
-output strays too far from it. The result is pasted into the session's input
-box with `thurbox-cli session send --no-enter`, unsubmitted. See
-[Context](#context) and [Cleanup pass](#cleanup-pass) for each stage.
+- **Palette** (`Ctrl+P`): `voice: cancel the recording`,
+  `voice: switch speech engine`.
+- **Settings** (`Ctrl+,`): `voice.engine`, `parakeet` or `whisper`.
 
 ## Engines
 
 | Engine | Model | Download | Licence |
 |---|---|---|---|
-| `parakeet` | NVIDIA Parakeet TDT 0.6B v3, int8 ONNX | 671 MB | CC-BY-4.0 |
-| `whisper` | OpenAI Whisper large-v3-turbo, q5_0 GGML (Metal on macOS) | 574 MB | MIT |
+| `parakeet` (default) | NVIDIA Parakeet TDT 0.6B v3, int8 ONNX, 25 languages | 671 MB | CC-BY-4.0 |
+| `whisper` | OpenAI Whisper large-v3-turbo, q5_0 GGML, 99 languages (Metal on macOS) | 574 MB | MIT |
 
-Models are pinned to a Hugging Face revision and checked against a SHA-256.
-They are stored under `$THURBOX_VOICE_HOME`, else
-`$XDG_DATA_HOME/thurbox-voice`, else `~/.local/share/thurbox-voice`.
+`thurbox-voice pull whisper` adds the second one. Models are pinned to a
+Hugging Face revision and checked against a SHA-256. They live under
+`$THURBOX_VOICE_HOME`, else `$XDG_DATA_HOME/thurbox-voice`, else
+`~/.local/share/thurbox-voice`.
 
-## Build
+## What leaves your machine
 
-You need Rust and `cmake` (for whisper.cpp): `brew install cmake` on macOS.
-
-```bash
-cargo install --path crates/thurbox-voice
+```mermaid
+flowchart LR
+    mic[microphone] --> stt["speech to text<br/>Parakeet or Whisper"]
+    stt --> cleanup{{"cleanup pass<br/>on by default"}}
+    ctx["context: word lists, session name,<br/>repo, branch, agent, last ~60 screen lines"] --> cleanup
+    cleanup --> send["thurbox-cli session send --no-enter"]
+    stt -. "--raw, or cleanup off" .-> send
+    subgraph local [always on your machine]
+        mic
+        stt
+        send
+    end
 ```
 
-## Try it
-
-```bash
-thurbox-voice pull parakeet
-thurbox-voice pull whisper
-thurbox-voice models
-
-# Talk, then press Enter.
-thurbox-voice test
-thurbox-voice test --engine whisper --vocabulary "thurbox, kubectl, Spotpay"
-
-# Keep a recording, then replay the same audio through both engines.
-thurbox-voice test --save clip.wav
-thurbox-voice test --file clip.wav --engine parakeet --engine whisper
-
-# Median load and inference time per engine, from every run so far.
-thurbox-voice stats
-```
-
-- **Microphone permission.** The first recording triggers a microphone prompt
-  for your **terminal app**, not for thurbox-voice. If you get "the microphone
-  delivered pure silence", allow the terminal in System Settings › Privacy &
-  Security › Microphone and restart it.
-- **Run log.** Every transcription is appended to `compare.jsonl` in the data
-  directory, recording the engine, the trimmed audio length, the load and
-  inference times, and the text.
-
-## Context
-
-The cleanup model is told what you are probably talking about:
-
-- **Built-in words** that are always in play, like `thurbox`, `tmux`,
-  `worktree`, `Claude Code`, `Codex` and `nextest`, so "toolbox" becomes
-  "thurbox".
-- **Your glossary**, set in `config.toml`:
-
-  ```toml
-  [context]
-  glossary = ["Spotpay", "payouts", "ledger"]
-  ```
-
-- **The target session:** its name, repo, branch and agent, plus the last ~60
-  lines of its screen (`thurbox-cli session capture`).
-
-Whisper is also primed with the same word list.
-
-## Cleanup pass
-
-Speech models mishear jargon ("cargo next test"). An optional second pass has
-an LLM fix misheard words, using whatever context it is given, before the text
-is pasted. It is on by default once a backend is reachable. `--raw` skips it.
+- **Audio never does.** Recording and transcription are local.
+- **Text can.** The cleanup pass gives the transcript, plus the context above,
+  to a language model that fixes misheard words ("cargo next test" →
+  `cargo nextest`). That model is hosted unless you point it at a local
+  server. `backend = "auto"` follows the session's agent: for `claude`, the
+  Anthropic API if `ANTHROPIC_API_KEY` is set, else `claude -p` on your
+  existing login; for `codex`, `[cleanup.openai]` if configured, else
+  `codex exec`. For any other agent it tries those two APIs, then that agent's
+  CLI, then the first of `claude`, `codex`, `gemini`, `opencode` on `PATH`.
+- **To keep text local**, turn cleanup off, or point it at an
+  OpenAI-compatible server on your machine (Ollama, LM Studio, llama.cpp):
 
 ```toml
-# ~/.config/thurbox-voice/config.toml (`thurbox-voice config` prints the path)
+# ~/.config/thurbox-voice/config.toml — `thurbox-voice config` prints the path
+# and which backend would be used.
+[cleanup]
+enabled = false           # paste the raw transcript
+
+# …or keep it on, locally:
+# backend = "openai"
+# [cleanup.openai]
+# model = "your-model-id"
+# base_url = "http://localhost:11434/v1"
+```
+
+The cleanup model only corrects words. If its output drifts too far from the
+transcript (length or shared words), it is refused and the raw transcript is
+pasted instead; if no backend answers, the raw transcript is pasted too.
+
+### Cleanup configuration
+
+```toml
 [cleanup]
 enabled = true
-backend = "auto"          # "auto" | "anthropic" | "openai" | "agent"
+backend = "auto"            # "auto" | "anthropic" | "openai" | "agent"
 
-[cleanup.anthropic]       # key from ANTHROPIC_API_KEY
-model = "claude-haiku-5-5"  # the default: the newest Haiku
+[cleanup.anthropic]         # key from ANTHROPIC_API_KEY
+model = "claude-haiku-5-5"  # the default; the Messages API needs an exact id
 
-[cleanup.openai]          # any OpenAI-compatible endpoint, key from OPENAI_API_KEY
+[cleanup.openai]            # any OpenAI-compatible endpoint
 model = "your-model-id"
-base_url = "https://api.openai.com/v1"   # or http://localhost:11434/v1 (Ollama): fully local
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"   # not needed for a local base_url
 
-[cleanup.agent]           # headless agent CLI, reusing its login
-codex_model = "luna"      # a model family, resolved against Codex's catalog
-# command = [...]         # or a command of your own; the prompt is appended
+[cleanup.agent]             # a headless agent CLI, on its own login
+codex_model = "luna"        # a family, resolved against Codex's catalog
+# command = ["my-agent", "-p"]   # or your own; the prompt is appended
+
+[context]
+glossary = ["Spotpay", "payouts", "ledger"]   # your own words
 ```
 
-- **Choosing a backend.** `auto` follows `--agent`: `claude` prefers Anthropic,
-  `codex` prefers OpenAI. When neither key is set, it falls back to that
-  agent's own CLI, started lean: `claude -p --model haiku` (~1.7 s), or
-  `codex exec` with the newest Luna at low effort (~2.5 s). Either one uses
-  your subscription login.
-- **Choosing a model.** The Anthropic backend calls the Messages API, which
-  needs an exact model id: it defaults to `claude-haiku-5-5`, and
-  `[cleanup.anthropic] model` overrides it. The `claude` CLI fallback passes
-  the alias `haiku` instead, which Claude Code resolves to its newest Haiku.
-- **Refused outputs.** If the cleaned text drifts too far from the raw
-  transcript (length or shared words), it is refused and the raw text is kept.
-  This is how an output that *answers* the dictation, instead of correcting it,
-  is caught.
+The agent presets start each CLI lean: `claude -p --model haiku` with settings,
+tools and MCP servers switched off (~1.7 s), or `codex exec` with the newest
+Luna at low effort (~2.5 s). Context is a built-in word list (`thurbox`,
+`tmux`, `worktree`, `Claude Code`, `nextest`, …), your glossary, and the target
+session as `thurbox-cli` reports it. Whisper is also primed with the word
+lists.
+
+## Behind the key
+
+A daemon holds the microphone and the loaded model. `start` records through
+cpal at 16 kHz mono; `stop` trims silence, transcribes, runs the cleanup pass
+and pastes. It exits after `[voice] unload_after_secs` (default 600) idle,
+which frees the model's memory. The pane only calls
+`thurbox-voice start/stop/cancel`; `status` and `quit` are there too.
 
 ```bash
-thurbox-voice cleanup --agent codex "run cargo next test"   # text only, no audio
-thurbox-voice test --file clip.wav --agent claude --context-file ctx.txt
-thurbox-voice stats                                          # adds per-backend cleanup timings
+thurbox-voice models                     # what is installed
+thurbox-voice test                       # talk, press Enter, see text and timings
+thurbox-voice test --save clip.wav       # keep the recording…
+thurbox-voice test --file clip.wav --engine parakeet --engine whisper   # …and compare engines
+thurbox-voice cleanup --agent codex "run cargo next test"   # cleanup alone, no audio
+thurbox-voice stats                      # median load, inference and cleanup times
 ```
+
+- **`the microphone delivered pure silence`**: on macOS the permission prompt
+  is for your *terminal app*, not for thurbox-voice. Allow it in System
+  Settings › Privacy & Security › Microphone and restart the terminal.
+- **Logs** are in the data directory: `daemon.log` for the daemon, and
+  `compare.jsonl` with every transcription's engine, audio length, timings and
+  text.
+
+## Re-recording the demo
+
+[`demo/record.sh`](demo/record.sh) drives the installed thurbox and helper in a
+throwaway profile: its own config, data, tmux socket and `HOME`, with this
+checkout's plugin trusted and two opencode sessions. The microphone is a
+private PipeWire source that the script plays an espeak-ng sentence into, so
+no real microphone is opened. The script fails rather than render a step that
+did not happen: it waits for each strip state and checks that the target
+session shows the text. It needs Linux with PipeWire, asciinema 2.x and agg;
+the header lists the rest.
 
 ## Attribution
 
 Parakeet TDT 0.6B v3 © NVIDIA, licensed under
 [CC-BY-4.0](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3). The ONNX
 export is by [istupakov](https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx).
-Engines are run through [transcribe-rs](https://github.com/cjpais/transcribe-rs).
+Whisper © OpenAI, [MIT](https://github.com/openai/whisper). Engines are run
+through [transcribe-rs](https://github.com/cjpais/transcribe-rs).
