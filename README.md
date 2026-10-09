@@ -60,6 +60,25 @@ It keeps the model loaded between dictations and exits after
 `[voice] unload_after_secs` (default 600) of idle time. Its log is `daemon.log`
 in the data directory.
 
+## Architecture
+
+```text
+microphone ─▶ speech-to-text ─▶ LLM cleanup ─▶ thurbox session input
+   cpal        Parakeet or        + context      thurbox-cli session send
+               Whisper, local                    --no-enter
+```
+
+A daemon holds the microphone and the loaded model. On `start` it records
+through `cpal`, resampled to 16 kHz mono. On `stop` it transcribes on your
+machine with the selected engine: Parakeet TDT (ONNX) or Whisper
+(whisper.cpp), both run through transcribe-rs. The transcript then goes to an
+LLM that fixes misheard words, and only those. It is given the built-in word
+list, your glossary, and the target session's name, repo, branch and agent,
+plus the last ~60 lines of its screen. A guard keeps the raw text if the
+output strays too far from it. The result is pasted into the session's input
+box with `thurbox-cli session send --no-enter`, unsubmitted. See
+[Context](#context) and [Cleanup pass](#cleanup-pass) for each stage.
+
 ## Engines
 
 | Engine | Model | Download | Licence |
@@ -138,7 +157,7 @@ enabled = true
 backend = "auto"          # "auto" | "anthropic" | "openai" | "agent"
 
 [cleanup.anthropic]       # key from ANTHROPIC_API_KEY
-model = "claude-haiku-4-5"
+model = "claude-haiku-5-5"  # the default: the newest Haiku
 
 [cleanup.openai]          # any OpenAI-compatible endpoint, key from OPENAI_API_KEY
 model = "your-model-id"
@@ -154,6 +173,10 @@ codex_model = "luna"      # a model family, resolved against Codex's catalog
   agent's own CLI, started lean: `claude -p --model haiku` (~1.7 s), or
   `codex exec` with the newest Luna at low effort (~2.5 s). Either one uses
   your subscription login.
+- **Choosing a model.** The Anthropic backend calls the Messages API, which
+  needs an exact model id: it defaults to `claude-haiku-5-5`, and
+  `[cleanup.anthropic] model` overrides it. The `claude` CLI fallback passes
+  the alias `haiku` instead, which Claude Code resolves to its newest Haiku.
 - **Refused outputs.** If the cleaned text drifts too far from the raw
   transcript (length or shared words), it is refused and the raw text is kept.
   This is how an output that *answers* the dictation, instead of correcting it,
