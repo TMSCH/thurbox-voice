@@ -9,8 +9,14 @@ prompt and it is transcribed **on your machine**. No audio leaves it.
 
 `ctrl+space` starts recording for the selected session, and `ctrl+space` again
 stops it. The text is pasted into that session's input box **without being
-submitted**, so you read it and press Enter yourself. While you talk, the
-message bar shows `● REC 0:07 → <session>`.
+submitted**, so you read it and press Enter yourself.
+
+A one-line strip above the bars is always there, so nothing moves when you
+start or stop. It shows one of:
+
+- `○ ctrl+space to start talking → <session>` when idle;
+- `● REC 0:07 → <session>` while recording;
+- `⋯ transcribing`, then the outcome for a few seconds.
 
 ```bash
 # 1. The helper (needs Rust and cmake: `brew install cmake`)
@@ -22,6 +28,18 @@ thurbox-voice pull parakeet              # 671 MB; `pull whisper` for the other 
 thurbox-cli plugin install git+https://github.com/TMSCH/thurbox-voice
 # then in thurbox: Ctrl+,  →  ]  →  select "voice"  →  t   (trust it to run programs)
 ```
+
+**3. Place the strip.** Add this to `~/.config/thurbox/ui/layout.lua`, just
+before the message band (`if status_rows() > 0 then`). `thurbox-cli plugin
+check` reminds you if it is missing.
+
+```lua
+if filled(ctx, "voice") then
+  children[#children + 1] = { slot = "voice", len = 2 }
+end
+```
+
+It reserves two rows: the voice line, then a gap above the bars.
 
 **Requires** a thurbox with `run(…, { machine = "local" })`
 ([Thurbeen/thurbox#1369](https://github.com/Thurbeen/thurbox/pull/1369)), so the helper

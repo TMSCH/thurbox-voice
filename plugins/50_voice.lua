@@ -5,14 +5,16 @@
 -- LLM fix misheard words using that session's context, and pastes the text
 -- into its composer — never submitted, so you read it and press Enter.
 --
--- This pane draws nothing of its own. It only floats (a slot nothing places),
--- because floats render on every frame, which is what keeps the recording
--- message in the band refreshed while you talk.
+-- A one-line strip that is always there, in the `voice` slot, so nothing on
+-- screen moves when a recording starts or ends: idle, it says how to start;
+-- recording, it counts; afterwards it says what happened for a few seconds and
+-- goes back to idle. A blank row under it keeps it off the bars below.
 --
 -- Every program runs with `machine = "local"`: the microphone is on the machine
 -- running thurbox, whichever host the selected session lives on.
 
 local plugin_settings = require("lib.settings")
+local theme = require("lib.theme")
 
 local NAME = "voice"
 local BIN = "thurbox-voice"
@@ -23,9 +25,8 @@ local SWITCH = "voice.engine"
 
 local ENGINES = { "parakeet", "whisper" }
 
--- Seconds between refreshes of the recording message. The band drops a
--- message after five, so anything under that keeps it up without flicker.
-local REFRESH = 1
+-- How long an outcome stays on the strip before it returns to idle.
+local OUTCOME_SECONDS = 6
 
 -- `stop` transcribes, cleans up and pastes; an agent-CLI cleanup alone can take
 -- several seconds, so allow far more than `run`'s 30 s default.
@@ -49,14 +50,21 @@ local function engine()
   return plugin_settings.get(NAME, "engine", "parakeet")
 end
 
+--- The chord the toggle is bound to now, so a rebinding shows here too.
+local function chord()
+  local registry = thurbox and thurbox.registry
+  for _, entry in ipairs(registry and registry.keys or {}) do
+    if entry.action == TOGGLE then
+      return entry.key
+    end
+  end
+  return "ctrl+space"
+end
+
 --- Single-quoted for `sh -c`. A session id is a UUID, but quoting costs
 --- nothing and a hand-made id is not ours to trust.
 local function quote(text)
   return "'" .. tostring(text):gsub("'", "'\\''") .. "'"
-end
-
-local function say(text, level)
-  command("message", { text = text, level = level })
 end
 
 --- Queue one program; `render` starts it, since that is where `run` is asked
@@ -67,14 +75,20 @@ local function queue(verb, program)
   state.ask = { key = verb .. "." .. state.serial, verb = verb, program = program }
 end
 
+--- What the strip says until it is told something newer, and for how long.
+local function outcome(text, kind)
+  state.outcome = { text = text, kind = kind }
+  state.outcome_at = nil
+end
+
 local function clock(seconds)
   seconds = math.max(0, math.floor(seconds or 0))
   return string.format("%d:%02d", math.floor(seconds / 60), seconds % 60)
 end
 
---- What came back from a run, as one line for the band.
 local function first_line(text)
-  return ((text or ""):match("[^\n]+") or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  local line = (text or ""):match("[^\n]+") or ""
+  return (line:gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
 local function settle(ask, answer)
@@ -86,7 +100,7 @@ local function settle(ask, answer)
     if answer.timed_out then
       why = "thurbox-voice timed out"
     end
-    say("voice: " .. why:gsub("^Error: ", ""), "error")
+    outcome((why:gsub("^Error: ", "")), "error")
     return
   end
   if ask.verb == "start" then
@@ -95,24 +109,78 @@ local function settle(ask, answer)
     return
   end
   state.phase = nil
+  local target = state.session_name or "session"
   if ask.verb == "stop" then
-    local target = state.session_name or "session"
     if out:match("^dictated") then
-      say("✓ " .. out .. " → " .. target .. " (review, then Enter)", "success")
+      outcome(out .. " → " .. target .. " — review, then Enter", "ok")
     else
-      say("voice: " .. (out ~= "" and out or "nothing transcribed"))
+      outcome(out ~= "" and out or "nothing transcribed", "muted")
     end
   elseif ask.verb == "cancel" then
-    say("voice: recording discarded")
+    outcome("recording discarded", "muted")
   end
+end
+
+local function span(text, fg, bold)
+  return { text = text, style = { fg = fg, bold = bold } }
+end
+
+--- The strip's one line, for the state we are in.
+local function line(now)
+  local name = state.session_name or "session"
+  local key = chord()
+  if state.phase == "recording" then
+    state.since = state.since or now
+    return {
+      span(" ● REC ", theme.bad, true),
+      span(clock(now - state.since), theme.bad, true),
+      span("  → " .. name, theme.text),
+      span("  ·  " .. engine(), theme.muted),
+      span("  ·  " .. key .. " to stop", theme.hint),
+    }
+  end
+  if state.phase == "starting" then
+    return { span(" ◌ starting the microphone…", theme.muted) }
+  end
+  if state.phase == "stopping" then
+    return { span(" ⋯ transcribing for " .. name .. "…", theme.warn) }
+  end
+  if state.phase == "cancelling" then
+    return { span(" ◌ discarding…", theme.muted) }
+  end
+
+  local shown = state.outcome
+  if shown then
+    state.outcome_at = state.outcome_at or now
+    if now - state.outcome_at < OUTCOME_SECONDS then
+      local fg = shown.kind == "ok" and theme.ok
+        or shown.kind == "error" and theme.bad
+        or theme.muted
+      local mark = shown.kind == "ok" and " ✓ " or shown.kind == "error" and " ✗ " or " · "
+      return { span(mark, fg, true), span(shown.text, fg) }
+    end
+    state.outcome = nil
+  end
+
+  if not run then
+    return {
+      span(" ○ ", theme.muted),
+      span("voice needs trust: Ctrl+, then ] then t on voice", theme.muted),
+    }
+  end
+  local session = selected()
+  return {
+    span(" ○ ", theme.muted),
+    span(key, theme.hint, true),
+    span(" to start talking", theme.muted),
+    span(session and ("  → " .. (session.name or session.id)) or "  (select a session)", theme.muted),
+  }
 end
 
 return {
   name = NAME,
-  -- A slot the arrangement never places: this only ever floats, and never
-  -- actually returns a float, so it never takes a key.
-  slot = "float",
-  floats = true,
+  -- Placed by `layout.lua` as a strip two rows high: this line, then a gap.
+  slot = "voice",
   focusable = false,
   capabilities = { "run" },
 
@@ -136,13 +204,10 @@ return {
   },
 
   render = function(ctx)
-    if not run then
-      return { type = "text", text = "" }
-    end
     local now = ctx.elapsed or 0
 
     local ask = state.ask
-    if ask then
+    if ask and run then
       run(ask.key, ask.program, {
         machine = "local",
         timeout = ask.verb == "stop" and STOP_TIMEOUT or 15,
@@ -157,53 +222,31 @@ return {
       end
     end
 
-    if state.phase == "recording" then
-      state.since = state.since or now
-      if not state.said or now - state.said >= REFRESH then
-        state.said = now
-        say(
-          "● REC "
-            .. clock(now - state.since)
-            .. " → "
-            .. (state.session_name or "session")
-            .. " · "
-            .. engine()
-            .. " · ctrl+space to stop"
-        )
-      end
-    elseif state.phase == "stopping" and (not state.said or now - state.said >= REFRESH) then
-      state.said = now
-      say("⋯ transcribing for " .. (state.session_name or "session"))
-    end
-
-    return { type = "text", text = "" }
+    return { type = "text", text = { line(now) } }
   end,
 
   on_action = function(action)
     if action == TOGGLE then
       if not run then
-        say("voice: trust this plugin first — Ctrl+, then ] then t on voice", "error")
+        outcome("trust this plugin first: Ctrl+, then ] then t on voice", "error")
         return true
       end
       if state.phase == nil then
         local session = selected()
         if not session then
-          say("voice: select a session to dictate into", "error")
+          outcome("select a session to dictate into", "error")
           return true
         end
         state.phase = "starting"
+        state.outcome = nil
         state.session_name = session.name or session.id
-        state.said = nil
         queue(
           "start",
           BIN .. " start --session " .. quote(session.id) .. " --engine " .. quote(engine())
         )
       elseif state.phase == "starting" or state.phase == "recording" then
         state.phase = "stopping"
-        state.said = nil
         queue("stop", BIN .. " stop")
-      else
-        say("voice: still transcribing — one moment")
       end
       return true
     end
@@ -213,7 +256,7 @@ return {
         state.phase = "cancelling"
         queue("cancel", BIN .. " cancel")
       else
-        say("voice: not recording")
+        outcome("not recording", "muted")
       end
       return true
     end
@@ -226,7 +269,7 @@ return {
         end
       end
       command("set", { text = NAME .. ".engine", value = nextone })
-      say("voice: engine → " .. nextone .. " (from the next dictation)")
+      outcome("engine → " .. nextone .. " (from the next dictation)", "muted")
       return true
     end
 
