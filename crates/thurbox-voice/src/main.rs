@@ -114,18 +114,30 @@ impl CleanupArgs {
         if self.raw || !config.cleanup.enabled {
             return Ok(None);
         }
-        let context = match &self.context_file {
-            Some(path) => Some(
-                std::fs::read_to_string(path)
-                    .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?,
-            ),
-            None => None,
-        };
-        Ok(Some(Plan {
+        self.plan_always(config).map(Some)
+    }
+
+    /// The plan whether or not cleanup is on — what `cleanup` runs, since
+    /// asking for it by name is asking for it.
+    fn plan_always(&self, config: &config::Config) -> Result<Plan> {
+        Ok(Plan {
             backend: self.backend.unwrap_or(config.cleanup.backend),
             agent: self.agent.clone(),
-            context,
-        }))
+            context: Some(self.context(config)?),
+        })
+    }
+
+    /// The same context a dictation through thurbox gets — the built-in
+    /// thurbox vocabulary and the user's glossary — plus `--context-file`.
+    fn context(&self, config: &config::Config) -> Result<String> {
+        let mut context = context::build(&config.context.glossary, None).text;
+        if let Some(path) = &self.context_file {
+            let extra = std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
+            context.push('\n');
+            context.push_str(&extra);
+        }
+        Ok(context)
     }
 }
 
@@ -222,11 +234,7 @@ fn main() -> Result<()> {
             )
         }
         Command::Cleanup { text, cleanup } => {
-            let plan = cleanup.plan(&config)?.unwrap_or(Plan {
-                backend: cleanup.backend.unwrap_or(config.cleanup.backend),
-                agent: cleanup.agent.clone(),
-                context: None,
-            });
+            let plan = cleanup.plan_always(&config)?;
             let cleaned = plan.run(&config, &text)?;
             println!("{}", cleaned.text);
             Ok(())

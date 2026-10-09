@@ -116,7 +116,17 @@ impl Resolved {
         match self {
             Resolved::Anthropic { .. } => format!("anthropic:{}", config.anthropic.model),
             Resolved::OpenAi { model, .. } => format!("openai:{model}"),
-            Resolved::Agent { argv } => format!("agent:{}", argv.join(" ")),
+            Resolved::Agent { argv } => format!(
+                "agent:{}",
+                argv.iter()
+                    .map(|a| match a.as_str() {
+                        SYSTEM_SLOT => "<cleanup prompt>",
+                        "" => "\"\"",
+                        other => other,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
         }
     }
 }
