@@ -121,6 +121,7 @@ impl Resolved {
                 argv.iter()
                     .map(|a| match a.as_str() {
                         SYSTEM_SLOT => "<cleanup prompt>",
+                        CODEX_MODEL_SLOT => &config.agent.codex_model,
                         "" => "\"\"",
                         other => other,
                     })
@@ -173,7 +174,7 @@ fn agent_preset(agent: &str) -> Option<Vec<String>> {
         ],
         // Codex's time goes to the model, not to starting up: as configured
         // for coding (a frontier model at high effort) a one-line correction
-        // took ~4 s; its fast model at low effort takes ~2.3 s. The skips —
+        // took ~4 s; its fast model (Luna) at low effort takes ~2.3 s. The skips —
         // the user's config.toml (MCP servers, model, effort), rules, session
         // files — keep it from inheriting any of that. Login is unaffected:
         // auth still comes from CODEX_HOME.
@@ -187,7 +188,7 @@ fn agent_preset(agent: &str) -> Option<Vec<String>> {
             "--sandbox",
             "read-only",
             "--model",
-            "gpt-5.6-luna",
+            CODEX_MODEL_SLOT,
             "-c",
             "model_reasoning_effort=\"low\"",
         ],
@@ -220,7 +221,7 @@ fn call(config: &CleanupConfig, resolved: &Resolved, user: &str) -> Result<Strin
     match resolved {
         Resolved::Anthropic { key } => anthropic(config, key, user),
         Resolved::OpenAi { model, key } => openai(config, model, key.as_deref(), user),
-        Resolved::Agent { argv } => agent_cli(argv, user),
+        Resolved::Agent { argv } => agent_cli(config, argv, user),
     }
 }
 
@@ -376,14 +377,65 @@ fn openai(config: &CleanupConfig, model: &str, key: Option<&str>, user: &str) ->
         .to_string())
 }
 
+/// Stands for the Codex model in an argv: `[cleanup.agent] codex_model`,
+/// resolved against Codex's catalog when the command is run.
+const CODEX_MODEL_SLOT: &str = "{codex-model}";
+
+/// The newest catalog model whose id names `family` (`luna` →
+/// `gpt-5.6-luna` today), or `family` itself when it is already an exact id.
+/// `None` when Codex cannot say, and the preset then runs on Codex's default.
+/// Reading the catalog is local and takes ~40 ms, so it is read every time
+/// rather than cached — a cache here would be one more thing to go stale.
+fn codex_model(family: &str) -> Option<String> {
+    let output = Command::new("codex")
+        .args(["debug", "models"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let catalog: Value = serde_json::from_slice(&output.stdout).ok()?;
+    pick_model(&catalog, family)
+}
+
+fn pick_model(catalog: &Value, family: &str) -> Option<String> {
+    let family = family.to_lowercase();
+    let models = catalog["models"].as_array()?;
+    let slugs = || models.iter().filter_map(|m| m["slug"].as_str());
+    if let Some(exact) = slugs().find(|slug| slug.eq_ignore_ascii_case(&family)) {
+        return Some(exact.to_string());
+    }
+    // The catalog lists newest first; prefer a model it offers in its picker.
+    let listed = models
+        .iter()
+        .filter(|m| m["visibility"] == "list")
+        .filter_map(|m| m["slug"].as_str());
+    listed
+        .chain(slugs())
+        .find(|slug| slug.to_lowercase().contains(&family))
+        .map(str::to_string)
+}
+
 /// Stands for [`SYSTEM`] in an argv; replaced when the command is run. An agent
 /// that takes a system prompt of its own gets ours there, and only the
 /// transcript as its prompt.
 const SYSTEM_SLOT: &str = "{system}";
 
-fn agent_cli(argv: &[String], user: &str) -> Result<String> {
+fn agent_cli(config: &CleanupConfig, argv: &[String], user: &str) -> Result<String> {
     let (program, args) = argv.split_first().context("empty agent command")?;
     let has_slot = args.iter().any(|a| a == SYSTEM_SLOT);
+    let mut args: Vec<String> = args.to_vec();
+    if let Some(at) = args.iter().position(|a| a == CODEX_MODEL_SLOT) {
+        match codex_model(&config.agent.codex_model) {
+            Some(model) => args[at] = model,
+            None => {
+                eprintln!(
+                    "[cleanup] no codex model matching {:?}; using codex's default",
+                    config.agent.codex_model
+                );
+                // Drop `--model` and its placeholder.
+                args.drain(at - 1..=at);
+            }
+        }
+    }
     let args = args
         .iter()
         .map(|a| if a == SYSTEM_SLOT { SYSTEM } else { a.as_str() });
@@ -487,6 +539,34 @@ mod tests {
     fn a_summary_is_refused() {
         assert!(guard(RAW, "Bulk transfer endpoint, tests, PR.").is_some());
         assert!(guard(RAW, "  ").is_some());
+    }
+
+    #[test]
+    fn a_codex_family_resolves_to_its_newest_listed_model() {
+        let catalog = json!({ "models": [
+            { "slug": "gpt-6-astra", "visibility": "list" },
+            { "slug": "gpt-reserve", "visibility": "hide" },
+            { "slug": "gpt-6-luna-preview", "visibility": "hide" },
+            { "slug": "gpt-5.6-luna", "visibility": "list" },
+        ]});
+        assert_eq!(
+            pick_model(&catalog, "luna").as_deref(),
+            Some("gpt-5.6-luna")
+        );
+        assert_eq!(
+            pick_model(&catalog, "LUNA").as_deref(),
+            Some("gpt-5.6-luna")
+        );
+        // A hidden one is still reachable by name, and an exact id is kept.
+        assert_eq!(
+            pick_model(&catalog, "reserve").as_deref(),
+            Some("gpt-reserve")
+        );
+        assert_eq!(
+            pick_model(&catalog, "gpt-6-astra").as_deref(),
+            Some("gpt-6-astra")
+        );
+        assert_eq!(pick_model(&catalog, "nova"), None);
     }
 
     #[test]

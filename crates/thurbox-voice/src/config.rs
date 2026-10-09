@@ -117,13 +117,27 @@ impl Default for OpenAiConfig {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AgentConfig {
     /// argv for a headless agent; the prompt is appended as the last argument
     /// and the answer read from stdout. Unset means: pick the preset for the
     /// agent being dictated to.
     pub command: Option<Vec<String>>,
+    /// The Codex model family the codex preset uses — a name without a
+    /// version, resolved against Codex's own catalog at run time, so a new
+    /// release is picked up without a change here. An exact model id works
+    /// too.
+    pub codex_model: String,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            command: None,
+            codex_model: "luna".to_string(),
+        }
+    }
 }
 
 /// `$THURBOX_VOICE_CONFIG`, else `$XDG_CONFIG_HOME/thurbox-voice/config.toml`,

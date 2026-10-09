@@ -141,14 +141,16 @@ model = "claude-haiku-4-5"
 model = "your-model-id"
 base_url = "https://api.openai.com/v1"   # or http://localhost:11434/v1 (Ollama): fully local
 
-[cleanup.agent]           # headless agent CLI, reusing its login (slow, ~4-5 s)
-command = ["codex", "exec", "--skip-git-repo-check"]
+[cleanup.agent]           # headless agent CLI, reusing its login
+codex_model = "luna"      # a model family, resolved against Codex's catalog
+# command = [...]         # or a command of your own; the prompt is appended
 ```
 
 - **Choosing a backend.** `auto` follows `--agent`: `claude` prefers Anthropic,
   `codex` prefers OpenAI. When neither key is set, it falls back to that
-  agent's own CLI (`claude -p --model haiku`, `codex exec`, `gemini -p`,
-  `opencode run`).
+  agent's own CLI, started lean: `claude -p --model haiku` (~1.7 s), or
+  `codex exec` with the newest Luna at low effort (~2.5 s). Either one uses
+  your subscription login.
 - **Refused outputs.** If the cleaned text drifts too far from the raw
   transcript (length or shared words), it is refused and the raw text is kept.
   This is how an output that *answers* the dictation, instead of correcting it,
