@@ -171,7 +171,26 @@ fn agent_preset(agent: &str) -> Option<Vec<String>> {
             "--system-prompt",
             SYSTEM_SLOT,
         ],
-        a if a.starts_with("codex") => &["codex", "exec", "--skip-git-repo-check"],
+        // Codex's time goes to the model, not to starting up: as configured
+        // for coding (a frontier model at high effort) a one-line correction
+        // took ~4 s; its fast model at low effort takes ~2.3 s. The skips —
+        // the user's config.toml (MCP servers, model, effort), rules, session
+        // files — keep it from inheriting any of that. Login is unaffected:
+        // auth still comes from CODEX_HOME.
+        a if a.starts_with("codex") => &[
+            "codex",
+            "exec",
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--sandbox",
+            "read-only",
+            "--model",
+            "gpt-5.6-luna",
+            "-c",
+            "model_reasoning_effort=\"low\"",
+        ],
         a if a.starts_with("gemini") => &["gemini", "-p"],
         a if a.starts_with("opencode") => &["opencode", "run"],
         _ => return None,
