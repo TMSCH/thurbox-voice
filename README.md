@@ -24,7 +24,7 @@ thurbox-cli plugin install git+https://github.com/TMSCH/thurbox-voice
 ```
 
 **Requires** a thurbox with `run(…, { machine = "local" })`
-([Thurbeen/thurbox#TBD](https://github.com/Thurbeen/thurbox)), so the helper
+([Thurbeen/thurbox#1369](https://github.com/Thurbeen/thurbox/pull/1369)), so the helper
 runs on your machine (where the microphone is), even for a remote session.
 
 **In the palette** (`Ctrl+P`):
