@@ -140,7 +140,27 @@ fn agent_preset(agent: &str) -> Option<Vec<String>> {
     // By family, not exact name: thurbox agents are often variants of one CLI
     // (`claude-operator`, `claude-coder`, `flow-worker` run `claude`).
     let argv: &[&str] = match agent {
-        a if a.starts_with("claude") => &["claude", "-p", "--model", "haiku"],
+        // Everything Claude Code loads at startup that a one-shot correction
+        // does not need — settings, hooks, plugins, MCP servers, tools,
+        // skills, session files, and its own large system prompt (replaced by
+        // ours, see `agent_cli`) — switched off flag by flag. Not `--bare`,
+        // which would do it in one go but accepts only an API key, and the
+        // point here is the user's own subscription login.
+        a if a.starts_with("claude") => &[
+            "claude",
+            "-p",
+            "--model",
+            "haiku",
+            "--setting-sources",
+            "",
+            "--strict-mcp-config",
+            "--tools",
+            "",
+            "--disable-slash-commands",
+            "--no-session-persistence",
+            "--system-prompt",
+            SYSTEM_SLOT,
+        ],
         a if a.starts_with("codex") => &["codex", "exec", "--skip-git-repo-check"],
         a if a.starts_with("gemini") => &["gemini", "-p"],
         a if a.starts_with("opencode") => &["opencode", "run"],
@@ -327,12 +347,28 @@ fn openai(config: &CleanupConfig, model: &str, key: Option<&str>, user: &str) ->
         .to_string())
 }
 
+/// Stands for [`SYSTEM`] in an argv; replaced when the command is run. An agent
+/// that takes a system prompt of its own gets ours there, and only the
+/// transcript as its prompt.
+const SYSTEM_SLOT: &str = "{system}";
+
 fn agent_cli(argv: &[String], user: &str) -> Result<String> {
     let (program, args) = argv.split_first().context("empty agent command")?;
-    let prompt = format!("{SYSTEM}\n\n{user}");
+    let has_slot = args.iter().any(|a| a == SYSTEM_SLOT);
+    let args = args
+        .iter()
+        .map(|a| if a == SYSTEM_SLOT { SYSTEM } else { a.as_str() });
+    let prompt = if has_slot {
+        user.to_string()
+    } else {
+        format!("{SYSTEM}\n\n{user}")
+    };
     let output = Command::new(program)
         .args(args)
         .arg(prompt)
+        // Away from any repository, so no project CLAUDE.md or AGENTS.md is
+        // discovered and read on the way in.
+        .current_dir(std::env::temp_dir())
         .stdin(std::process::Stdio::null())
         .output()
         .with_context(|| format!("run {program}"))?;
@@ -450,6 +486,11 @@ mod tests {
         assert_eq!(agent_preset("codex").unwrap()[0], "codex");
         // Variants of one CLI share its preset.
         assert_eq!(agent_preset("claude-operator").unwrap()[0], "claude");
+        // Claude gets our system prompt in place of its own.
+        assert!(agent_preset("claude")
+            .unwrap()
+            .iter()
+            .any(|a| a == SYSTEM_SLOT));
         assert_eq!(agent_preset("codex-heavy").unwrap()[0], "codex");
         assert!(agent_preset("aider").is_none());
     }
