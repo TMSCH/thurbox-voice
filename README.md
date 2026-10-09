@@ -96,16 +96,21 @@ flowchart LR
   to a language model that fixes misheard words ("cargo next test" →
   `cargo nextest`). That model is hosted unless you point it at a local
   server. `backend = "auto"` follows the session's agent: for `claude`, the
-  Anthropic API if `ANTHROPIC_API_KEY` is set, else `claude -p` on your
-  existing login; for `codex`, `[cleanup.openai]` if configured, else
-  `codex exec`. For any other agent it tries those two APIs, then that agent's
-  CLI, then the first of `claude`, `codex`, `gemini`, `opencode` on `PATH`.
+  Anthropic API if `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` is set, else
+  `[cleanup.agent] command` if set, else `claude -p` on your existing login;
+  for `codex`, `[cleanup.openai]` if configured, else that command or
+  `codex exec`. For any other agent it tries those two APIs, then that
+  command or the agent's own CLI, then the first of `claude`, `codex`,
+  `gemini`, `opencode` on `PATH`. **If the choice fails, `auto` tries each of
+  those installed CLIs in turn**, all of them hosted.
 - **To keep text local**, turn cleanup off, or point it at an
-  OpenAI-compatible server on your machine (Ollama, LM Studio, llama.cpp):
+  OpenAI-compatible server on your machine (Ollama, LM Studio, llama.cpp)
+  *with `backend = "openai"`*: under `auto`, a local server that is down
+  hands the text to the next backend.
 
 ```toml
 # ~/.config/thurbox-voice/config.toml — `thurbox-voice config` prints the path
-# and which backend would be used.
+# and the configured backend.
 [cleanup]
 enabled = false           # paste the raw transcript
 
@@ -118,7 +123,7 @@ enabled = false           # paste the raw transcript
 
 The cleanup model only corrects words. If its output drifts too far from the
 transcript (length or shared words), it is refused and the raw transcript is
-pasted instead; if no backend answers, the raw transcript is pasted too.
+pasted instead; if no backend answers at all, the raw transcript is pasted too.
 
 ### Cleanup configuration
 
@@ -127,7 +132,7 @@ pasted instead; if no backend answers, the raw transcript is pasted too.
 enabled = true
 backend = "auto"            # "auto" | "anthropic" | "openai" | "agent"
 
-[cleanup.anthropic]         # key from ANTHROPIC_API_KEY
+[cleanup.anthropic]         # key from ANTHROPIC_API_KEY, or ANTHROPIC_AUTH_TOKEN
 model = "claude-haiku-5-5"  # the default; the Messages API needs an exact id
 
 [cleanup.openai]            # any OpenAI-compatible endpoint
@@ -144,18 +149,19 @@ glossary = ["Spotpay", "payouts", "ledger"]   # your own words
 ```
 
 The agent presets start each CLI lean: `claude -p --model haiku` with settings,
-tools and MCP servers switched off (~1.7 s), or `codex exec` with the newest
-Luna at low effort (~2.5 s). Context is a built-in word list (`thurbox`,
+tools and MCP servers switched off, or `codex exec` with a Luna model from
+Codex's catalog at low effort. Context is a built-in word list (`thurbox`,
 `tmux`, `worktree`, `Claude Code`, `nextest`, …), your glossary, and the target
 session as `thurbox-cli` reports it. Whisper is also primed with the word
 lists.
 
 ## Behind the key
 
-A daemon holds the microphone and the loaded model. `start` records through
-cpal at 16 kHz mono; `stop` trims silence, transcribes, runs the cleanup pass
-and pastes. It exits after `[voice] unload_after_secs` (default 600) idle,
-which frees the model's memory. The pane only calls
+A daemon holds the microphone and the loaded model. `start` records from the
+default input through cpal; `stop` resamples to 16 kHz mono, trims silence,
+transcribes, runs the cleanup pass and pastes. It exits after
+`[voice] unload_after_secs` seconds idle (default 600, at least 30), which
+frees the model's memory. The pane only calls
 `thurbox-voice start/stop/cancel`; `status` and `quit` are there too.
 
 ```bash

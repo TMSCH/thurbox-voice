@@ -13,11 +13,12 @@
 # Isolation, so a recording never touches the thurbox you work in:
 #   * thurbox runs on its own config, data dir, tmux socket and TMUX_TMPDIR;
 #   * thurbox-voice runs on its own data dir (THURBOX_VOICE_HOME), with the
-#     models linked read-only from your store, and its own config with the
+#     models symlinked from your store (nothing here writes to them), and its own config with the
 #     cleanup pass off, so no transcript leaves the machine;
 #   * HOME is a fresh directory, so opencode boots with no account or history;
 #   * the daemon captures from the virtual source by name (PIPEWIRE_NODE). The
-#     default source is not changed, and the script checks that it was not.
+#     default source is not changed, and the script checks both: that the
+#     capture is linked to the virtual source, and that the default stayed.
 #
 # Requirements: thurbox, thurbox-cli and thurbox-voice on PATH, with the
 # Parakeet model pulled (`thurbox-voice pull parakeet`); opencode; tmux, git,
@@ -76,7 +77,7 @@ cleanup() {
         sleep 1
         tmux -L tvdemo kill-server 2>/dev/null || true
     done
-    cp "$THURBOX_VOICE_HOME/daemon.log" "$SBX/" 2>/dev/null || true
+    cp "$SHORT/voice/daemon.log" "$SBX/" 2>/dev/null || true
     [ -n "$LOOPBACK" ] && kill "$LOOPBACK" 2>/dev/null || true
     rm -rf "$SHORT"
 }
@@ -132,6 +133,14 @@ import json, sys
 paths = json.load(sys.stdin)["paths"]
 print(paths["ui_dir"]); print(paths["ui_json"]); print(paths["database"])')
 { IFS= read -r UI_DIR; IFS= read -r UI_JSON; IFS= read -r DB; } <<< "$paths"
+# The next lines overwrite the trust file and write to the database: refuse
+# unless thurbox resolved both inside the sandbox.
+for path in "$UI_DIR" "$UI_JSON" "$DB"; do
+    case "$path" in
+        "$SBX"/* | "$SHORT"/*) ;;
+        *) echo "error: thurbox resolved $path, outside the sandbox" >&2; exit 1 ;;
+    esac
+done
 
 # A grant is a decision made in a running interface (Ctrl+, then ] then t), and
 # there is no CLI for it. Write what that decision writes: the pin and digest
@@ -198,11 +207,14 @@ tmux -L tvdemo-rec new-session -d -x "$COLS" -y "$ROWS" -c "$REPO" -s r \
 
 send() { tmux -L tvdemo-rec send-keys -t r "$@"; }
 screen() { tmux -L tvdemo-rec capture-pane -p -t r; }
+# grep a captured string rather than a pipe: under pipefail an early `grep -q`
+# exit can fail the writer with SIGPIPE.
+shows() { local text; text=$(screen); grep -qF -- "$1" <<< "$text"; }
 # Wait up to $2 seconds for the screen to show $1; fail the run if it never does,
 # so a clip never ships a step that did not happen.
 await() {
     for _ in $(seq 1 $(($2 * 10))); do
-        screen | grep -qF -- "$1" && return 0
+        shows "$1" && return 0
         sleep 0.1
     done
     echo "error: never saw '$1' on screen. Last screen:" >&2
@@ -221,22 +233,40 @@ sleep 1.5
 send C-Space
 await "● REC" 15
 mark rec
+# The daemon must be capturing from the demo source and nothing else. (A
+# dictation of your own running at the same moment fails this too: rerun.)
+sources=$(pw-link -l | awk '/^[^ ]/ { node = $0 }
+    node ~ /^alsa_capture[.]thurbox-voice:/ && /[|]<-/ { print $2 }' | sort -u)
+if [ -z "$sources" ] || grep -qv "^$SOURCE_NODE:" <<< "$sources"; then
+    echo "error: the daemon captures from '${sources:-nothing}', not $SOURCE_NODE" >&2
+    exit 1
+fi
 sleep 0.6
 pw-play --target "$SINK_NODE" "$SBX/sentence.wav"
 sleep 0.6
 send C-Space
 await "dictated" 60
-# The text is in the composer, and nothing submitted it.
+# The text is in the composer, and nothing submitted it: opencode shows its
+# "Ask anything" placeholder again once a prompt is sent.
 sleep 1
-thurbox-cli session capture "$TARGET" --lines 60 --text | grep -qF "empty recording" || {
-    echo "error: the transcript is not on the target session's screen" >&2
+words=$(printf '%s\n' "$SENTENCE" | awk '{ print $1, $2, $3 }')
+target_screen=$(thurbox-cli session capture "$TARGET" --lines 60 --text)
+grep -qiF -- "$words" <<< "$target_screen" || {
+    echo "error: '$words' is not on the target session's screen" >&2
     exit 1
 }
+if grep -qF "Ask anything" <<< "$target_screen"; then
+    echo "error: the composer is empty again; was the text submitted?" >&2
+    exit 1
+fi
 sleep 4
 mark end
 send C-q
 sleep 3
-[ "$(pactl get-default-source)" = "$before" ] || echo "warning: the default source changed" >&2
+[ "$(pactl get-default-source)" = "$before" ] || {
+    echo "error: the default source changed during the recording" >&2
+    exit 1
+}
 
 # --- Cut and render ----------------------------------------------------------
 # Keep from 1.5 s before `ready` to `end`; everything earlier collapses into the
