@@ -179,8 +179,12 @@ end
 
 return {
   name = NAME,
-  -- Placed by `layout.lua` as a strip two rows high: this line, then a gap.
+  -- A strip two rows high: this line, then a gap above the bars. thurbox
+  -- places strips by itself (`ctx.strips`); a layout.lua from before strips
+  -- needs `{ slot = "voice", len = 2 }` added instead.
   slot = "voice",
+  strip = true,
+  size = { len = 2 },
   focusable = false,
   capabilities = { "run" },
 

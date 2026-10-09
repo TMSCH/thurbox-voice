@@ -29,17 +29,20 @@ thurbox-cli plugin install git+https://github.com/TMSCH/thurbox-voice
 # then in thurbox: Ctrl+,  →  ]  →  select "voice"  →  t   (trust it to run programs)
 ```
 
-**3. Place the strip.** Add this to `~/.config/thurbox/ui/layout.lua`, just
-before the message band (`if status_rows() > 0 then`). `thurbox-cli plugin
-check` reminds you if it is missing.
+**3. The strip places itself.** The pane declares itself a strip, and
+thurbox places strips above the bars on its own
+([Thurbeen/thurbox#1370](https://github.com/Thurbeen/thurbox/pull/1370)).
+That takes two rows: the voice line, then a gap.
+
+If your `~/.config/thurbox/ui/layout.lua` is customised and predates strips,
+`thurbox-cli plugin check` will say so. Add this once, before the message band
+(`if status_rows() > 0 then`):
 
 ```lua
-if filled(ctx, "voice") then
-  children[#children + 1] = { slot = "voice", len = 2 }
+for _, strip in ipairs(ctx.strips or {}) do
+  children[#children + 1] = { slot = strip.slot, len = strip.len }
 end
 ```
-
-It reserves two rows: the voice line, then a gap above the bars.
 
 **Requires** a thurbox with `run(…, { machine = "local" })`
 ([Thurbeen/thurbox#1369](https://github.com/Thurbeen/thurbox/pull/1369)), so the helper
