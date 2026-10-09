@@ -37,6 +37,9 @@ pub struct CleanupLog {
     pub secs: f64,
     /// Why the guard refused the output, when it did.
     pub rejected: Option<String>,
+    /// What the model said when it was refused, so a refusal can be judged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_output: Option<String>,
 }
 
 pub fn append(root: &Path, entry: &Entry) -> Result<()> {

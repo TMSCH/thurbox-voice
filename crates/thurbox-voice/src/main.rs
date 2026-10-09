@@ -414,6 +414,10 @@ fn test(
                         let log = stats::CleanupLog {
                             backend: cleaned.backend,
                             secs: cleaned.secs,
+                            model_output: cleaned
+                                .rejected
+                                .is_some()
+                                .then(|| cleaned.model_output.clone()),
                             rejected: cleaned.rejected,
                         };
                         (cleaned.text, Some(text), Some(log))
