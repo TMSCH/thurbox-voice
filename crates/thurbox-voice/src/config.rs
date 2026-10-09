@@ -13,7 +13,36 @@ use serde::Deserialize;
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    pub voice: VoiceConfig,
+    pub context: ContextConfig,
     pub cleanup: CleanupConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VoiceConfig {
+    /// The speech engine the daemon uses unless a `start` names another.
+    pub engine: crate::engine::EngineId,
+    /// The daemon exits after this long with nothing to do, which is what
+    /// gives the model's memory back. Its next `start` reloads it.
+    pub unload_after_secs: u64,
+}
+
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        Self {
+            engine: crate::engine::EngineId::Parakeet,
+            unload_after_secs: 600,
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ContextConfig {
+    /// Words you say that a speech model will not know: your company, your
+    /// services, your colleagues' names. Added to the built-in thurbox list.
+    pub glossary: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, clap::ValueEnum)]
@@ -135,6 +164,19 @@ mod tests {
         assert_eq!(config.cleanup.backend, Backend::Auto);
         assert_eq!(config.cleanup.anthropic.model, "claude-haiku-4-5");
         assert!(config.cleanup.openai.model.is_none());
+        assert_eq!(config.voice.engine, crate::engine::EngineId::Parakeet);
+        assert!(config.context.glossary.is_empty());
+    }
+
+    #[test]
+    fn voice_and_context_parse() {
+        let config: Config = toml::from_str(
+            "[voice]\nengine = \"whisper\"\nunload_after_secs = 60\n\n[context]\nglossary = [\"Spotpay\"]\n",
+        )
+        .unwrap();
+        assert_eq!(config.voice.engine, crate::engine::EngineId::Whisper);
+        assert_eq!(config.voice.unload_after_secs, 60);
+        assert_eq!(config.context.glossary, vec!["Spotpay"]);
     }
 
     #[test]

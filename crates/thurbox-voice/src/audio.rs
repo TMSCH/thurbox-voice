@@ -27,8 +27,66 @@ impl Clip {
     }
 }
 
-/// Record from the default input device until the user presses Enter.
-pub fn record_until_enter() -> Result<Clip> {
+/// A recording in progress. The cpal stream is not `Send` on every platform,
+/// so it lives on a thread of its own and this handle only talks to it.
+pub struct Recorder {
+    stop: std::sync::mpsc::Sender<()>,
+    thread: std::thread::JoinHandle<()>,
+    buffer: Arc<Mutex<Vec<f32>>>,
+    rate: u32,
+    pub device: String,
+    pub started: Instant,
+}
+
+impl Recorder {
+    /// Open the default input device and start filling the buffer. Returns
+    /// once the stream is running, or with the reason it could not start.
+    pub fn start() -> Result<Self> {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(u32, String)>>();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+        let shared = Arc::clone(&buffer);
+        let thread = std::thread::spawn(move || {
+            let stream = match open(&shared) {
+                Ok((stream, rate, name)) => {
+                    let _ = ready_tx.send(Ok((rate, name)));
+                    stream
+                }
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e));
+                    return;
+                }
+            };
+            // Held until told to stop, or until the handle is dropped.
+            let _ = stop_rx.recv();
+            drop(stream);
+        });
+        let (rate, device) = ready_rx
+            .recv()
+            .context("the audio thread exited before starting")??;
+        Ok(Self {
+            stop: stop_tx,
+            thread,
+            buffer,
+            rate,
+            device,
+            started: Instant::now(),
+        })
+    }
+
+    /// Stop recording and hand back everything captured.
+    pub fn stop(self) -> Clip {
+        let _ = self.stop.send(());
+        let _ = self.thread.join();
+        let samples = std::mem::take(&mut *self.buffer.lock().unwrap());
+        Clip {
+            samples,
+            rate: self.rate,
+        }
+    }
+}
+
+fn open(buffer: &Arc<Mutex<Vec<f32>>>) -> Result<(cpal::Stream, u32, String)> {
     let host = cpal::default_host();
     let device = host
         .default_input_device()
@@ -42,29 +100,34 @@ pub fn record_until_enter() -> Result<Clip> {
         .description()
         .map(|d| d.to_string())
         .unwrap_or_else(|_| "default input".to_string());
-
-    let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::with_capacity(rate as usize * 60)));
-    let err_fn = |err| eprintln!("\naudio stream error: {err}");
-
+    buffer.lock().unwrap().reserve(rate as usize * 60);
+    let err_fn = |err| eprintln!("audio stream error: {err}");
     let stream = match config.sample_format() {
-        SampleFormat::F32 => build::<f32>(&device, config.into(), channels, &buffer, err_fn)?,
-        SampleFormat::I16 => build::<i16>(&device, config.into(), channels, &buffer, err_fn)?,
-        SampleFormat::I32 => build::<i32>(&device, config.into(), channels, &buffer, err_fn)?,
-        SampleFormat::U16 => build::<u16>(&device, config.into(), channels, &buffer, err_fn)?,
+        SampleFormat::F32 => build::<f32>(&device, config.into(), channels, buffer, err_fn)?,
+        SampleFormat::I16 => build::<i16>(&device, config.into(), channels, buffer, err_fn)?,
+        SampleFormat::I32 => build::<i32>(&device, config.into(), channels, buffer, err_fn)?,
+        SampleFormat::U16 => build::<u16>(&device, config.into(), channels, buffer, err_fn)?,
         other => bail!("unsupported input sample format {other:?}"),
     };
     stream.play().context("start the input stream")?;
+    Ok((stream, rate, name))
+}
 
-    eprintln!("● recording from {name} ({rate} Hz) — press Enter to stop");
-    let started = Instant::now();
+/// Record from the default input device until the user presses Enter.
+pub fn record_until_enter() -> Result<Clip> {
+    let recorder = Recorder::start()?;
+    eprintln!(
+        "● recording from {} ({} Hz) — press Enter to stop",
+        recorder.device, recorder.rate
+    );
     let mut line = String::new();
     io::stdin().lock().read_line(&mut line)?;
-    drop(stream);
-    eprintln!("■ stopped after {:.1}s", started.elapsed().as_secs_f64());
+    eprintln!(
+        "■ stopped after {:.1}s",
+        recorder.started.elapsed().as_secs_f64()
+    );
     io::stderr().flush().ok();
-
-    let samples = std::mem::take(&mut *buffer.lock().unwrap());
-    Ok(Clip { samples, rate })
+    Ok(recorder.stop())
 }
 
 fn build<T>(

@@ -1,19 +1,22 @@
 //! thurbox-voice: local dictation for thurbox.
 //!
-//! This is the phase-0 spike: a plain CLI to record or read a clip, transcribe
-//! it with Parakeet or Whisper, optionally have an LLM fix misheard words, and
-//! log timings so engines and cleanup backends can be compared on real
-//! prompts. The daemon and the thurbox pane come later.
+//! Two halves. `start`/`stop`/`cancel`/`status` drive a background daemon that
+//! records, transcribes, has an LLM fix misheard words, and pastes the result
+//! into a thurbox session — what the thurbox pane calls. `test`, `cleanup` and
+//! `stats` are the same pipeline in the foreground, for measuring engines and
+//! cleanup backends on real prompts.
 
 mod audio;
 mod cleanup;
 mod config;
+mod context;
+mod daemon;
 mod engine;
 mod models;
 mod stats;
 
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Result};
 use clap::{Args, Parser, Subcommand};
@@ -65,6 +68,26 @@ enum Command {
     Config,
     /// Summarise compare.jsonl per engine and per cleanup backend.
     Stats,
+    /// Start recording (launching the daemon if needed). Returns at once.
+    Start {
+        /// Session to paste the text into when recording stops.
+        #[arg(long)]
+        session: Option<String>,
+        /// Override `[voice] engine` for this dictation.
+        #[arg(long, value_enum)]
+        engine: Option<EngineId>,
+    },
+    /// Stop recording, transcribe, clean up, and paste into the session.
+    Stop,
+    /// Stop recording and throw the audio away.
+    Cancel,
+    /// What the daemon is doing.
+    Status,
+    /// Stop the daemon, freeing the model's memory.
+    Quit,
+    /// Run the daemon in the foreground (what `start` launches).
+    #[command(hide = true)]
+    Daemon,
 }
 
 #[derive(Args)]
@@ -222,7 +245,90 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Stats => stats::print(&root),
+        Command::Start { session, engine } => {
+            let mut ask = serde_json::json!({ "cmd": "start" });
+            if let Some(session) = session {
+                ask["session"] = session.into();
+            }
+            if let Some(engine) = engine {
+                ask["engine"] = engine.as_str().into();
+            }
+            let reply = client(&root, &ask, true, Duration::from_secs(10))?;
+            println!("recording with {}", reply["engine"].as_str().unwrap_or("?"));
+            Ok(())
+        }
+        Command::Stop => {
+            let ask = serde_json::json!({ "cmd": "stop" });
+            let reply = client(&root, &ask, false, Duration::from_secs(120))?;
+            if reply["empty"] == true || reply["text"].as_str() == Some("") {
+                println!("no speech heard");
+            } else if reply["pasted"] == true {
+                println!("dictated {} chars", reply["chars"]);
+            } else if let Some(why) = reply["paste_error"].as_str() {
+                bail!(
+                    "transcribed but not pasted ({why}): {}",
+                    reply["text"].as_str().unwrap_or("")
+                );
+            } else {
+                println!("{}", reply["text"].as_str().unwrap_or(""));
+            }
+            Ok(())
+        }
+        Command::Cancel => {
+            client(
+                &root,
+                &serde_json::json!({ "cmd": "cancel" }),
+                false,
+                Duration::from_secs(5),
+            )?;
+            println!("cancelled");
+            Ok(())
+        }
+        Command::Status => {
+            // Not running is an answer here, not an error.
+            let reply = daemon::request(
+                &root,
+                &serde_json::json!({ "cmd": "status" }),
+                false,
+                Duration::from_secs(5),
+            )?;
+            println!("{reply}");
+            Ok(())
+        }
+        Command::Quit => {
+            // The daemon exits mid-request, so no answer is the expected one.
+            let _ = daemon::request(
+                &root,
+                &serde_json::json!({ "cmd": "quit" }),
+                false,
+                Duration::from_secs(2),
+            );
+            println!("stopped");
+            Ok(())
+        }
+        Command::Daemon => daemon::serve(&root, config),
     }
+}
+
+/// One request to the daemon; a refusal becomes an error, so the exit status
+/// and stderr carry it to whoever ran us.
+fn client(
+    root: &Path,
+    ask: &serde_json::Value,
+    launch: bool,
+    wait: Duration,
+) -> Result<serde_json::Value> {
+    let reply = daemon::request(root, ask, launch, wait)?;
+    if reply["ok"] != true {
+        bail!(
+            "{}",
+            reply["error"].as_str().unwrap_or("the daemon refused")
+        );
+    }
+    if !launch && reply["running"] == false {
+        bail!("not recording — the daemon is not running");
+    }
+    Ok(reply)
 }
 
 fn test(

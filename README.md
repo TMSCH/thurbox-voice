@@ -3,9 +3,41 @@
 Local dictation for [thurbox](https://github.com/Thurbeen/thurbox): speak a
 prompt and it is transcribed **on your machine**. No audio leaves it.
 
-**Status: phase-0 spike.** This is a plain CLI for measuring the engines on real
-prompts. The thurbox pane (`ctrl+space` to talk) and the background daemon come
-next.
+**Status: early.** It works end to end; expect rough edges.
+
+## Use it in thurbox
+
+`ctrl+space` starts recording for the selected session, and `ctrl+space` again
+stops it. The text is pasted into that session's input box **without being
+submitted**, so you read it and press Enter yourself. While you talk, the
+message bar shows `● REC 0:07 → <session>`.
+
+```bash
+# 1. The helper (needs Rust and cmake: `brew install cmake`)
+git clone https://github.com/TMSCH/thurbox-voice && cd thurbox-voice
+cargo install --path crates/thurbox-voice
+thurbox-voice pull parakeet              # 671 MB; `pull whisper` for the other engine
+
+# 2. The pane
+thurbox-cli plugin install git+https://github.com/TMSCH/thurbox-voice
+# then in thurbox: Ctrl+,  →  ]  →  select "voice"  →  t   (trust it to run programs)
+```
+
+**Requires** a thurbox with `run(…, { machine = "local" })`
+([Thurbeen/thurbox#TBD](https://github.com/Thurbeen/thurbox)), so the helper
+runs on your machine (where the microphone is), even for a remote session.
+
+**In the palette** (`Ctrl+P`):
+
+- `voice: cancel the recording`
+- `voice: switch speech engine`
+
+**In settings** (`Ctrl+,`): `voice.engine`.
+
+**Behind the key** is a daemon (`thurbox-voice start/stop/cancel/status/quit`).
+It keeps the model loaded between dictations and exits after
+`[voice] unload_after_secs` (default 600) of idle time. Its log is `daemon.log`
+in the data directory.
 
 ## Engines
 
@@ -52,6 +84,25 @@ thurbox-voice stats
 - **Run log.** Every transcription is appended to `compare.jsonl` in the data
   directory, recording the engine, the trimmed audio length, the load and
   inference times, and the text.
+
+## Context
+
+The cleanup model is told what you are probably talking about:
+
+- **Built-in words** that are always in play, like `thurbox`, `tmux`,
+  `worktree`, `Claude Code`, `Codex` and `nextest`, so "toolbox" becomes
+  "thurbox".
+- **Your glossary**, set in `config.toml`:
+
+  ```toml
+  [context]
+  glossary = ["Spotpay", "payouts", "ledger"]
+  ```
+
+- **The target session:** its name, repo, branch and agent, plus the last ~60
+  lines of its screen (`thurbox-cli session capture`).
+
+Whisper is also primed with the same word list.
 
 ## Cleanup pass
 
