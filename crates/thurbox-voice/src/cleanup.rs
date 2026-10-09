@@ -55,13 +55,35 @@ pub fn run(
     raw: &str,
 ) -> Result<Cleaned> {
     let user = user_message(context, raw);
-    let resolved = resolve(config, backend, agent)?;
+    let mut resolved = resolve(config, backend, agent)?;
     let started = Instant::now();
-    let output = match &resolved {
-        Resolved::Anthropic { key } => anthropic(config, key, &user)?,
-        Resolved::OpenAi { model, key } => openai(config, model, key.as_deref(), &user)?,
-        Resolved::Agent { argv } => agent_cli(argv, &user)?,
-    };
+    let mut attempt = call(config, &resolved, &user);
+    // Chosen automatically and failed (an agent CLI whose login expired, say):
+    // try the other installed agent CLIs before giving up on cleanup.
+    if attempt.is_err() && backend == Backend::Auto && config.agent.command.is_none() {
+        let tried = match &resolved {
+            Resolved::Agent { argv } => argv.first().cloned(),
+            _ => None,
+        };
+        for name in INSTALLED_ORDER
+            .iter()
+            .filter(|n| Some(n.to_string()) != tried)
+        {
+            let Some(argv) = installed(name).then(|| agent_preset(name)).flatten() else {
+                continue;
+            };
+            let next = Resolved::Agent { argv };
+            match call(config, &next, &user) {
+                Ok(output) => {
+                    resolved = next;
+                    attempt = Ok(output);
+                    break;
+                }
+                Err(e) => eprintln!("[cleanup] {} failed too: {e:#}", name),
+            }
+        }
+    }
+    let output = attempt?;
     let secs = started.elapsed().as_secs_f64();
     let output = unwrap_output(&output);
     let rejected = guard(raw, &output);
@@ -115,14 +137,42 @@ fn openai_key(config: &CleanupConfig) -> Option<String> {
 /// The headless invocation for a known agent, used when `[cleanup.agent]`
 /// names no command.
 fn agent_preset(agent: &str) -> Option<Vec<String>> {
+    // By family, not exact name: thurbox agents are often variants of one CLI
+    // (`claude-operator`, `claude-coder`, `flow-worker` run `claude`).
     let argv: &[&str] = match agent {
-        "claude" => &["claude", "-p", "--model", "haiku"],
-        "codex" => &["codex", "exec", "--skip-git-repo-check"],
-        "gemini" => &["gemini", "-p"],
-        "opencode" => &["opencode", "run"],
+        a if a.starts_with("claude") => &["claude", "-p", "--model", "haiku"],
+        a if a.starts_with("codex") => &["codex", "exec", "--skip-git-repo-check"],
+        a if a.starts_with("gemini") => &["gemini", "-p"],
+        a if a.starts_with("opencode") => &["opencode", "run"],
         _ => return None,
     };
     Some(argv.iter().map(|s| s.to_string()).collect())
+}
+
+/// The agent CLIs worth trying when nothing names one, fastest first.
+const INSTALLED_ORDER: &[&str] = &["claude", "codex", "gemini", "opencode"];
+
+/// The first agent CLI on `PATH`, as its preset. What makes cleanup work with
+/// no configuration at all: anyone running thurbox has at least one.
+fn installed_preset() -> Option<Vec<String>> {
+    INSTALLED_ORDER
+        .iter()
+        .find(|name| installed(name))
+        .and_then(|name| agent_preset(name))
+}
+
+fn installed(program: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()))
+        .unwrap_or(false)
+}
+
+fn call(config: &CleanupConfig, resolved: &Resolved, user: &str) -> Result<String> {
+    match resolved {
+        Resolved::Anthropic { key } => anthropic(config, key, user),
+        Resolved::OpenAi { model, key } => openai(config, model, key.as_deref(), user),
+        Resolved::Agent { argv } => agent_cli(argv, user),
+    }
 }
 
 /// Which family an agent belongs to, for `auto`: the agent's own vendor is
@@ -151,6 +201,7 @@ fn resolve(config: &CleanupConfig, backend: Backend, agent: Option<&str>) -> Res
             .command
             .clone()
             .or_else(|| agent.and_then(agent_preset))
+            .or_else(installed_preset)
             .map(|argv| Resolved::Agent { argv })
     };
     let found = match backend {
@@ -397,5 +448,9 @@ mod tests {
         assert_eq!(family("codex"), Some(Backend::Openai));
         assert_eq!(family("aider"), None);
         assert_eq!(agent_preset("codex").unwrap()[0], "codex");
+        // Variants of one CLI share its preset.
+        assert_eq!(agent_preset("claude-operator").unwrap()[0], "claude");
+        assert_eq!(agent_preset("codex-heavy").unwrap()[0], "codex");
+        assert!(agent_preset("aider").is_none());
     }
 }
