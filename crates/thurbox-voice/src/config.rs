@@ -81,6 +81,8 @@ impl Default for CleanupConfig {
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AnthropicConfig {
+    /// A Messages API model id. The API has no family alias like `haiku`, so
+    /// this is an exact id; the default is the newest Haiku.
     pub model: String,
     pub base_url: String,
 }
@@ -88,7 +90,7 @@ pub struct AnthropicConfig {
 impl Default for AnthropicConfig {
     fn default() -> Self {
         Self {
-            model: "claude-haiku-4-5".to_string(),
+            model: "claude-haiku-5-5".to_string(),
             base_url: "https://api.anthropic.com".to_string(),
         }
     }
@@ -176,7 +178,7 @@ mod tests {
         let config: Config = toml::from_str("").unwrap();
         assert!(config.cleanup.enabled);
         assert_eq!(config.cleanup.backend, Backend::Auto);
-        assert_eq!(config.cleanup.anthropic.model, "claude-haiku-4-5");
+        assert_eq!(config.cleanup.anthropic.model, "claude-haiku-5-5");
         assert!(config.cleanup.openai.model.is_none());
         assert_eq!(config.voice.engine, crate::engine::EngineId::Parakeet);
         assert!(config.context.glossary.is_empty());
@@ -214,6 +216,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.cleanup.backend, Backend::Openai);
+        // A pinned model overrides the default.
+        assert_eq!(config.cleanup.anthropic.model, "claude-haiku-4-5");
         assert_eq!(config.cleanup.openai.model.as_deref(), Some("luna"));
         assert_eq!(config.cleanup.agent.command.unwrap()[0], "codex");
     }

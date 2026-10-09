@@ -333,7 +333,9 @@ fn anthropic(config: &CleanupConfig, key: &Key, user: &str) -> Result<String> {
     let response = request
         .send_json(json!({
             "model": config.anthropic.model,
-            "max_tokens": 2048,
+            // Haiku 5.5 thinks by default, and its thinking counts against
+            // this cap: leave room for it on top of the corrected text.
+            "max_tokens": 8192,
             "system": SYSTEM,
             "messages": [{ "role": "user", "content": user }],
         }))
