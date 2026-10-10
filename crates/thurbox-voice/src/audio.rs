@@ -95,6 +95,11 @@ impl Recorder {
                 .is_err()
             {
                 let mut samples = shared.lock().unwrap();
+                // Two minutes is more than any test records; a run killed
+                // mid-recording must not grow without bound.
+                if samples.len() >= 120 * RATE as usize {
+                    continue;
+                }
                 for _ in 0..(RATE as usize / 50) {
                     sign = -sign;
                     samples.push(sign * GATE / 10.0);

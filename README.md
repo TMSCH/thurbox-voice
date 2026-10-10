@@ -63,6 +63,9 @@ Nothing is ever submitted for you.
 - **Palette** (`Ctrl+P`): `voice: stop recording and transcribe`,
   `voice: cancel the recording`, `voice: switch speech recognition model`.
   Stop and cancel reach the daemon's recording even after an interface reload.
+  A press made then shows that recording and its session, and only the next
+  press stops it. It never takes the recording over for a session it was not
+  started for.
 - **Settings** (`F6` or `Ctrl+,`), both kept across restarts:
   - `voice.engine` is the speech recognition model: `parakeet` (the default)
     or `whisper`. It is not the cleanup model, which `config.toml` sets.

@@ -159,12 +159,21 @@ local function settle(ask, answer)
     queue("status", BIN .. " status")
     return
   end
-  if ask.verb == "status" then
+  if ask.verb == "status" and answer.ok then
     local status = answer.stdout or ""
     if status:match('"state":"recording"') then
       state.engine = status:match('"engine":"([%w_-]+)"') or state.engine
       local id = status:match('"session":"([^"]+)"')
       state.session_name = id and session_name(id) or "session"
+      if state.requested and id ~= state.requested then
+        -- A press meant for another session: this recording is not theirs, so
+        -- neither its release nor a press made meanwhile may stop it — that
+        -- would paste what they said into a session they did not pick. The
+        -- strip names it, and only a press made now stops it.
+        state.pending = nil
+        state.hold = false
+        state.foreign = true
+      end
       began()
       return
     end
@@ -217,6 +226,9 @@ local function line(now)
   if state.phase == "recording" then
     state.since = state.since or now
     local how = state.hold and ("release " .. key .. " to stop") or (key .. " to stop")
+    if state.foreign then
+      how = "already recording — " .. key .. " to stop it"
+    end
     return {
       span(" ● REC ", theme.bad, true),
       span(clock(now - state.since), theme.bad, true),
@@ -373,6 +385,8 @@ return {
         state.phase = "starting"
         state.outcome = nil
         state.pending = nil
+        state.foreign = false
+        state.requested = session.id
         state.session_name = session.name or session.id
         state.engine = engine()
         state.hold = holding()
@@ -404,6 +418,7 @@ return {
         state.phase = "starting"
         state.pending = "stop"
         state.outcome = nil
+        state.requested = nil
         queue("status", BIN .. " status")
       end
       return true

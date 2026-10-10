@@ -955,3 +955,70 @@ fn the_palette_has_a_stop_that_reaches_any_recording() {
     host.action("voice.stop", None);
     host.until("not recording");
 }
+
+#[test]
+fn live_a_press_never_takes_over_another_sessions_recording_as_its_own() {
+    let daemon = Daemon::new("other-session");
+    {
+        let mut before = Host::live(Keyboard::Releases("reported"), &daemon);
+        before.press();
+        before.until("REC");
+    }
+    // After a reload the user picks another session and holds the key to talk
+    // to it: the running recording is for "api", not for them.
+    let mut host = Host::live(Keyboard::Releases("reported"), &daemon);
+    host.set("mode", "hold");
+    host.select("22222222-bbbb");
+    host.press();
+    host.release();
+    let shown = host.until("already recording");
+    assert!(shown.contains("→ api"), "{shown}");
+    assert!(
+        daemon.recording(),
+        "a release does not stop someone else's recording"
+    );
+    // Only a deliberate press, with the strip naming its session, stops it.
+    host.press();
+    host.until("no speech heard");
+    assert!(!daemon.recording());
+}
+
+#[test]
+fn a_failed_status_is_reported_not_taken_for_idle() {
+    let mut host = Host::new(Keyboard::Releases("reported"));
+    host.action("voice.stop", None);
+    host.frame();
+    host.answer(
+        "thurbox-voice status",
+        false,
+        "",
+        "Error: no answer from the thurbox-voice daemon",
+    );
+    let shown = host.frame();
+    assert!(
+        shown.contains("no answer from the thurbox-voice daemon"),
+        "{shown}"
+    );
+}
+
+#[test]
+fn live_a_daemon_whose_socket_is_gone_exits_even_while_recording() {
+    let daemon = Daemon::new("orphan");
+    let mut host = Host::live(Keyboard::Releases("reported"), &daemon);
+    host.press();
+    host.until("REC");
+    // What a killed test run leaves: its directory deleted, the daemon alive.
+    std::fs::remove_file(daemon.home.join("daemon.sock")).unwrap();
+    let log = daemon.home.join("daemon.log");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .contains("socket is gone")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the daemon kept running without its socket"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}

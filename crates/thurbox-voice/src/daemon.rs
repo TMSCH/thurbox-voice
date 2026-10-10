@@ -144,6 +144,13 @@ pub fn serve(root: &Path, config: Config) -> Result<()> {
                 last = Instant::now();
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Nobody can reach a daemon whose socket was deleted — its data
+                // directory removed, say — so a recording it holds could never
+                // be stopped. Exit rather than record forever.
+                if !socket.exists() {
+                    eprintln!("[daemon] the socket is gone, exiting");
+                    break;
+                }
                 if daemon.recording.is_none() && last.elapsed() > idle_limit {
                     eprintln!("[daemon] idle for {}s, exiting", idle_limit.as_secs());
                     break;
