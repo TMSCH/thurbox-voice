@@ -928,3 +928,30 @@ fn live_cancel_reaches_a_recording_the_pane_lost_track_of() {
     host.until("discarded");
     assert!(!daemon.recording());
 }
+
+#[test]
+fn the_palette_has_a_stop_that_reaches_any_recording() {
+    let host = Host::new(Keyboard::Releases("reported"));
+    let stop = host.declared("commands", "action", "voice.stop");
+    assert!(stop.get::<String>("desc").unwrap().contains("stop"));
+
+    let daemon = Daemon::new("palette-stop");
+    {
+        let mut before = Host::live(Keyboard::Releases("reported"), &daemon);
+        before.press();
+        before.until("REC");
+        before.action("voice.stop", None);
+        before.until("no speech heard");
+        assert!(!daemon.recording());
+        before.press();
+        before.until("REC");
+    }
+    // After a reload, too.
+    let mut host = Host::live(Keyboard::Releases("reported"), &daemon);
+    host.action("voice.stop", None);
+    host.until("no speech heard");
+    assert!(!daemon.recording());
+    // And with nothing recording, it says so.
+    host.action("voice.stop", None);
+    host.until("not recording");
+}

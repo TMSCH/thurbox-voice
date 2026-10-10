@@ -60,8 +60,9 @@ The session, the speech model and the recording mode are fixed when you start:
 change the selection or a setting mid-sentence and this dictation is unchanged.
 Nothing is ever submitted for you.
 
-- **Palette** (`Ctrl+P`): `voice: cancel the recording`,
-  `voice: switch speech recognition model`.
+- **Palette** (`Ctrl+P`): `voice: stop recording and transcribe`,
+  `voice: cancel the recording`, `voice: switch speech recognition model`.
+  Stop and cancel reach the daemon's recording even after an interface reload.
 - **Settings** (`F6` or `Ctrl+,`), both kept across restarts:
   - `voice.engine` is the speech recognition model: `parakeet` (the default)
     or `whisper`. It is not the cleanup model, which `config.toml` sets.

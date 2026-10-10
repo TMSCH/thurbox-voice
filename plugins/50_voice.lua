@@ -26,6 +26,7 @@ local BIN = "thurbox-voice"
 
 local TOGGLE = "voice.toggle"
 local CANCEL = "voice.cancel"
+local STOP = "voice.stop"
 local SWITCH = "voice.engine"
 
 local ENGINES = { "parakeet", "whisper" }
@@ -169,7 +170,7 @@ local function settle(ask, answer)
     end
     state.phase = nil
     state.pending = nil
-    outcome("the earlier recording has ended", "muted")
+    outcome("not recording", "muted")
     return
   end
   if ask.verb == "cancel" and (out == "nothing to cancel" or err:match("not recording")) then
@@ -317,6 +318,7 @@ return {
   },
 
   commands = {
+    { action = STOP, desc = "voice: stop recording and transcribe" },
     { action = CANCEL, desc = "voice: cancel the recording" },
     { action = SWITCH, desc = "voice: switch speech recognition model (parakeet / whisper)" },
   },
@@ -386,6 +388,23 @@ return {
       elseif state.phase == "recording" then
         state.phase = "stopping"
         queue("stop", BIN .. " stop")
+      end
+      return true
+    end
+
+    if action == STOP then
+      if state.phase == "starting" then
+        state.pending = state.pending or "stop"
+      elseif state.phase == "recording" then
+        state.phase = "stopping"
+        queue("stop", BIN .. " stop")
+      elseif state.phase == nil then
+        -- Ask the daemon rather than answer "not recording" from here: it may
+        -- be holding a recording this pane lost track of.
+        state.phase = "starting"
+        state.pending = "stop"
+        state.outcome = nil
+        queue("status", BIN .. " status")
       end
       return true
     end
