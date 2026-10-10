@@ -11,6 +11,7 @@
 //! --no-enter --force` — so the pane that asked only needs the summary.
 
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -122,6 +123,9 @@ pub fn serve(root: &Path, config: Config) -> Result<()> {
         std::fs::remove_file(&socket).ok();
     }
     let listener = UnixListener::bind(&socket).context("bind the daemon socket")?;
+    let bound = std::fs::metadata(&socket)
+        .context("stat the daemon socket")?
+        .ino();
     listener.set_nonblocking(true)?;
     eprintln!("[daemon] listening on {}", socket.display());
 
@@ -147,7 +151,12 @@ pub fn serve(root: &Path, config: Config) -> Result<()> {
                 // Nobody can reach a daemon whose socket was deleted — its data
                 // directory removed, say — so a recording it holds could never
                 // be stopped. Exit rather than record forever.
-                if !socket.exists() {
+                let gone = match std::fs::metadata(&socket) {
+                    Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+                    // Another daemon's socket at our path: ours is unreachable.
+                    Ok(meta) => meta.ino() != bound,
+                };
+                if gone {
                     eprintln!("[daemon] the socket is gone, exiting");
                     break;
                 }
@@ -193,7 +202,6 @@ impl Daemon {
             "quit" => {
                 self.recording = None;
                 self.unload();
-                // The accept loop notices the missing socket on its next turn.
                 std::fs::remove_file(socket_path(&self.root)).ok();
                 std::process::exit(0);
             }

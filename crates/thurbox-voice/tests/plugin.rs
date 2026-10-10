@@ -1022,3 +1022,33 @@ fn live_a_daemon_whose_socket_is_gone_exits_even_while_recording() {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+#[test]
+fn a_palette_cancel_or_stop_survives_finding_another_sessions_recording() {
+    const RUNNING: &str = r#"{"device":"mic","engine":"parakeet","ok":true,"running":true,"session":"11111111-aaaa","state":"recording"}"#;
+    for (action, then) in [
+        (CANCEL, "thurbox-voice cancel"),
+        ("voice.stop", "thurbox-voice stop"),
+    ] {
+        let mut host = Host::new(Keyboard::Releases("reported"));
+        host.select("22222222-bbbb");
+        host.press();
+        host.frame();
+        host.action(action, None);
+        host.answer(
+            "thurbox-voice start",
+            false,
+            "",
+            "Error: already recording — stop or cancel first",
+        );
+        host.frame();
+        host.answer("thurbox-voice status", true, RUNNING, "");
+        host.frame();
+        assert_eq!(
+            host.programs().last().unwrap(),
+            then,
+            "what the palette asked for still happens: {:?}",
+            host.programs()
+        );
+    }
+}

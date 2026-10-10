@@ -140,7 +140,7 @@ local function began()
   state.since = nil
   local pending = state.pending
   state.pending = nil
-  if pending == "stop" then
+  if pending == "stop" or pending == "asked stop" then
     state.phase = "stopping"
     queue("stop", BIN .. " stop")
   elseif pending == "cancel" then
@@ -169,8 +169,12 @@ local function settle(ask, answer)
         -- A press meant for another session: this recording is not theirs, so
         -- neither its release nor a press made meanwhile may stop it — that
         -- would paste what they said into a session they did not pick. The
-        -- strip names it, and only a press made now stops it.
-        state.pending = nil
+        -- strip names it, and only a press made now stops it. A stop or
+        -- cancel chosen from the palette ("asked stop", "cancel") was meant
+        -- for whatever is recording, and still goes.
+        if state.pending == "stop" then
+          state.pending = nil
+        end
         state.hold = false
         state.foreign = true
       end
@@ -408,7 +412,7 @@ return {
 
     if action == STOP then
       if state.phase == "starting" then
-        state.pending = state.pending or "stop"
+        state.pending = state.pending or "asked stop"
       elseif state.phase == "recording" then
         state.phase = "stopping"
         queue("stop", BIN .. " stop")
