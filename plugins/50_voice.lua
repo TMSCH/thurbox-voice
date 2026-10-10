@@ -1,9 +1,14 @@
 -- thurbox-voice: dictate into the selected session.
 --
--- `ctrl+space` starts recording for the session that is selected *now*; the
--- next `ctrl+space` stops, and the `thurbox-voice` daemon transcribes, has an
--- LLM fix misheard words using that session's context, and pastes the text
--- into its composer — never submitted, so you read it and press Enter.
+-- `ctrl+space` starts recording for the session that is selected *now*. In the
+-- default `toggle` mode the next `ctrl+space` stops; in `hold` mode letting go
+-- of it does. The `thurbox-voice` daemon then transcribes, has an LLM fix
+-- misheard words using that session's context, and pastes the text into its
+-- composer — never submitted, so you read it and press Enter.
+--
+-- The session, the speech model and the mode are captured when a recording
+-- starts: switching session or changing a setting mid-sentence changes the
+-- next dictation, never this one.
 --
 -- A one-line strip that is always there, in the `voice` slot, so nothing on
 -- screen moves when a recording starts or ends: idle, it says how to start;
@@ -21,9 +26,18 @@ local BIN = "thurbox-voice"
 
 local TOGGLE = "voice.toggle"
 local CANCEL = "voice.cancel"
+local STOP = "voice.stop"
 local SWITCH = "voice.engine"
 
 local ENGINES = { "parakeet", "whisper" }
+local MODES = { "toggle", "hold" }
+
+-- What each engine id runs, for the strip. The speech model only: the
+-- cleanup model is the daemon's `[cleanup]` config, and `stop` reports it.
+local MODELS = {
+  parakeet = "Parakeet TDT 0.6B v3",
+  whisper = "Whisper large-v3-turbo",
+}
 
 -- How long an outcome stays on the strip before it returns to idle.
 local OUTCOME_SECONDS = 6
@@ -48,6 +62,23 @@ end
 
 local function engine()
   return plugin_settings.get(NAME, "engine", "parakeet")
+end
+
+local function model(id)
+  return MODELS[id] or id
+end
+
+--- Whether this thurbox can tell us the chord was let go. A thurbox from
+--- before key releases publishes no `keyboard` at all.
+local function releases_reported()
+  local keyboard = thurbox and thurbox.keyboard
+  return keyboard ~= nil and keyboard.releases ~= nil and keyboard.releases ~= "unsupported"
+end
+
+--- `hold` only where a release can arrive; anywhere else it would have no way
+--- to stop but a second press, which is `toggle`.
+local function holding()
+  return plugin_settings.get(NAME, "mode", "toggle") == "hold" and releases_reported()
 end
 
 --- The chord the toggle is bound to now, so a rebinding shows here too.
@@ -91,11 +122,78 @@ local function first_line(text)
   return (line:gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
+--- The name the strip uses for a session id, from the current snapshot.
+local function session_name(id)
+  for _, session in ipairs(thurbox and thurbox.sessions or {}) do
+    if session.id == id then
+      return session.name or session.id
+    end
+  end
+  return id
+end
+
+--- The recording is running: send whatever was asked for while it started.
+--- Sent alongside the start, a stop or cancel could reach the daemon first and
+--- leave the microphone on.
+local function began()
+  state.phase = "recording"
+  state.since = nil
+  local pending = state.pending
+  state.pending = nil
+  if pending == "stop" or pending == "asked stop" then
+    state.phase = "stopping"
+    queue("stop", BIN .. " stop")
+  elseif pending == "cancel" then
+    state.phase = "cancelling"
+    queue("cancel", BIN .. " cancel")
+  end
+end
+
 local function settle(ask, answer)
   local out = first_line(answer.stdout)
   local err = first_line(answer.stderr)
+  -- The daemon is recording already, for a pane that no longer knows it — an
+  -- interface reload starts this file over with empty state. Ask what it is
+  -- recording and take it over, so the shortcut and cancel reach it again.
+  if ask.verb == "start" and not answer.ok and err:match("already recording") then
+    queue("status", BIN .. " status")
+    return
+  end
+  if ask.verb == "status" and answer.ok then
+    local status = answer.stdout or ""
+    if status:match('"state":"recording"') then
+      state.engine = status:match('"engine":"([%w_-]+)"') or state.engine
+      local id = status:match('"session":"([^"]+)"')
+      state.session_name = id and session_name(id) or "session"
+      if state.requested and id ~= state.requested then
+        -- A press meant for another session: this recording is not theirs, so
+        -- neither its release nor a press made meanwhile may stop it — that
+        -- would paste what they said into a session they did not pick. The
+        -- strip names it, and only a press made now stops it. A stop or
+        -- cancel chosen from the palette ("asked stop", "cancel") was meant
+        -- for whatever is recording, and still goes.
+        if state.pending == "stop" then
+          state.pending = nil
+        end
+        state.hold = false
+        state.foreign = true
+      end
+      began()
+      return
+    end
+    state.phase = nil
+    state.pending = nil
+    outcome("not recording", "muted")
+    return
+  end
+  if ask.verb == "cancel" and (out == "nothing to cancel" or err:match("not recording")) then
+    state.phase = nil
+    outcome("not recording", "muted")
+    return
+  end
   if answer.state == "failed" or not answer.ok then
     state.phase = nil
+    state.pending = nil
     local why = err ~= "" and err or (answer.error or "thurbox-voice failed")
     if answer.timed_out then
       why = "thurbox-voice timed out"
@@ -104,8 +202,7 @@ local function settle(ask, answer)
     return
   end
   if ask.verb == "start" then
-    state.phase = "recording"
-    state.since = nil
+    began()
     return
   end
   state.phase = nil
@@ -129,21 +226,28 @@ end
 local function line(now)
   local name = state.session_name or "session"
   local key = chord()
+  local recorded = model(state.engine or engine())
   if state.phase == "recording" then
     state.since = state.since or now
+    local how = state.hold and ("release " .. key .. " to stop") or (key .. " to stop")
+    if state.foreign then
+      how = "already recording — " .. key .. " to stop it"
+    end
     return {
       span(" ● REC ", theme.bad, true),
       span(clock(now - state.since), theme.bad, true),
       span("  → " .. name, theme.text),
-      span("  ·  " .. engine(), theme.muted),
-      span("  ·  " .. key .. " to stop", theme.hint),
+      span("  ·  " .. recorded, theme.muted),
+      span("  ·  " .. how, theme.hint),
     }
   end
   if state.phase == "starting" then
-    return { span(" ◌ starting the microphone…", theme.muted) }
+    return { span(" ◌ starting the microphone…  ·  " .. recorded, theme.muted) }
   end
   if state.phase == "stopping" then
-    return { span(" ⋯ transcribing for " .. name .. "…", theme.warn) }
+    return {
+      span(" ⋯ transcribing with " .. recorded .. " for " .. name .. "…", theme.warn),
+    }
   end
   if state.phase == "cancelling" then
     return { span(" ◌ discarding…", theme.muted) }
@@ -169,12 +273,24 @@ local function line(now)
     }
   end
   local session = selected()
-  return {
-    span(" ○ ", theme.muted),
-    span(key, theme.hint, true),
-    span(" to start talking", theme.muted),
-    span(session and ("  → " .. (session.name or session.id)) or "  (select a session)", theme.muted),
-  }
+  local target = session and ("  → " .. (session.name or session.id)) or "  (select a session)"
+  local idle = { span(" ○ ", theme.muted) }
+  if holding() then
+    idle[#idle + 1] = span("hold " .. key, theme.hint, true)
+    idle[#idle + 1] = span(" to talk", theme.muted)
+  else
+    idle[#idle + 1] = span(key, theme.hint, true)
+    idle[#idle + 1] = span(" to start talking", theme.muted)
+  end
+  idle[#idle + 1] = span(target, theme.muted)
+  idle[#idle + 1] = span("  ·  " .. model(engine()), theme.muted)
+  if plugin_settings.get(NAME, "mode", "toggle") == "hold" and not holding() then
+    idle[#idle + 1] = span(
+      "  ·  hold unavailable: this terminal reports no key releases — press to start, press to stop",
+      theme.warn
+    )
+  end
+  return idle
 end
 
 return {
@@ -188,23 +304,39 @@ return {
   focusable = false,
   capabilities = { "run" },
 
+  -- `choices` makes each a picker in settings (F6); a thurbox from before
+  -- choices ignores the field and shows a text field, which still works.
   settings = {
-    { id = "engine", desc = "Speech engine: parakeet or whisper", default = "parakeet" },
+    {
+      id = "engine",
+      desc = "Speech recognition model: parakeet (Parakeet TDT 0.6B v3) or whisper (Whisper large-v3-turbo); not the cleanup model",
+      default = "parakeet",
+      choices = ENGINES,
+    },
+    {
+      id = "mode",
+      desc = "Recording: toggle (press to start, press to stop) or hold (record while held; needs key releases)",
+      default = "toggle",
+      choices = MODES,
+    },
   },
 
   keys = {
     {
       key = "ctrl+space",
       action = TOGGLE,
-      desc = "dictate into the selected session (press again to stop)",
+      desc = "dictate into the selected session (press again, or let go in hold mode, to stop)",
       scope = "global",
       group = "Voice",
+      -- Asks for the release as well, and keeps auto-repeat from toggling.
+      release = true,
     },
   },
 
   commands = {
+    { action = STOP, desc = "voice: stop recording and transcribe" },
     { action = CANCEL, desc = "voice: cancel the recording" },
-    { action = SWITCH, desc = "voice: switch speech engine (parakeet / whisper)" },
+    { action = SWITCH, desc = "voice: switch speech recognition model (parakeet / whisper)" },
   },
 
   render = function(ctx)
@@ -229,8 +361,21 @@ return {
     return { type = "text", text = { line(now) } }
   end,
 
-  on_action = function(action)
+  -- `args.event` is "press" or "release" from a thurbox that reports key
+  -- releases; anything else (an older thurbox, the palette) is a press.
+  on_action = function(action, args)
     if action == TOGGLE then
+      local event = args and args.event or "press"
+      if event == "release" then
+        -- Only a hold ends on a release; a toggle's own release is noise.
+        if state.hold and state.phase == "starting" then
+          state.pending = state.pending or "stop"
+        elseif state.hold and state.phase == "recording" then
+          state.phase = "stopping"
+          queue("stop", BIN .. " stop")
+        end
+        return true
+      end
       if not run then
         outcome("trust this plugin first: Ctrl+, then ] then t on voice", "error")
         return true
@@ -243,24 +388,58 @@ return {
         end
         state.phase = "starting"
         state.outcome = nil
+        state.pending = nil
+        state.foreign = false
+        state.requested = session.id
         state.session_name = session.name or session.id
+        state.engine = engine()
+        state.hold = holding()
         queue(
           "start",
-          BIN .. " start --session " .. quote(session.id) .. " --engine " .. quote(engine())
+          BIN .. " start --session " .. quote(session.id) .. " --engine " .. quote(state.engine)
         )
-      elseif state.phase == "starting" or state.phase == "recording" then
+      elseif state.phase == "starting" then
+        -- A second press always stops, in either mode: it is also what ends a
+        -- hold whose release never arrived. A cancel already asked for stays
+        -- a cancel: what the user threw away is never transcribed.
+        state.pending = state.pending or "stop"
+      elseif state.phase == "recording" then
         state.phase = "stopping"
         queue("stop", BIN .. " stop")
       end
       return true
     end
 
+    if action == STOP then
+      if state.phase == "starting" then
+        -- Upgrades a press's own stop, so the takeover guard keeps it; never
+        -- downgrades a cancel.
+        if state.pending ~= "cancel" then
+          state.pending = "asked stop"
+        end
+      elseif state.phase == "recording" then
+        state.phase = "stopping"
+        queue("stop", BIN .. " stop")
+      elseif state.phase == nil then
+        -- Ask the daemon rather than answer "not recording" from here: it may
+        -- be holding a recording this pane lost track of.
+        state.phase = "starting"
+        state.pending = "stop"
+        state.outcome = nil
+        state.requested = nil
+        queue("status", BIN .. " status")
+      end
+      return true
+    end
+
     if action == CANCEL then
-      if state.phase == "recording" or state.phase == "starting" then
+      if state.phase == "starting" then
+        state.pending = "cancel"
+      elseif state.phase == "recording" or state.phase == nil then
+        -- Asked of the daemon even when this pane saw no recording start: it
+        -- may be holding one this pane lost track of.
         state.phase = "cancelling"
         queue("cancel", BIN .. " cancel")
-      else
-        outcome("not recording", "muted")
       end
       return true
     end
@@ -273,7 +452,7 @@ return {
         end
       end
       command("set", { text = NAME .. ".engine", value = nextone })
-      outcome("engine → " .. nextone .. " (from the next dictation)", "muted")
+      outcome("speech model → " .. model(nextone) .. " (from the next dictation)", "muted")
       return true
     end
 

@@ -22,3 +22,7 @@ whisper-rs = "0.16.0"
 # Whisper on the GPU where there is one to use.
 [target.'cfg(target_os = "macos")'.dependencies]
 transcribe-rs = { version = "0.3.12", features = ["whisper-metal"] }
+
+[dev-dependencies]
+# The pane's own tests run plugins/50_voice.lua in the Lua thurbox embeds.
+mlua = { version = "0.12.2", default-features = false, features = ["lua54", "vendored"] }

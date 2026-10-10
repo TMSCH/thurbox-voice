@@ -11,6 +11,7 @@
 //! --no-enter --force` — so the pane that asked only needs the summary.
 
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -108,6 +109,8 @@ struct Daemon {
     loading: Option<std::thread::JoinHandle<()>>,
     /// What the last `stop` is doing, for `status`.
     busy: Option<&'static str>,
+    /// Our socket's [`identity`], so `quit` removes only our own.
+    bound: (u64, u64),
 }
 
 pub fn serve(root: &Path, config: Config) -> Result<()> {
@@ -122,6 +125,7 @@ pub fn serve(root: &Path, config: Config) -> Result<()> {
         std::fs::remove_file(&socket).ok();
     }
     let listener = UnixListener::bind(&socket).context("bind the daemon socket")?;
+    let bound = identity(&std::fs::metadata(&socket).context("stat the daemon socket")?);
     listener.set_nonblocking(true)?;
     eprintln!("[daemon] listening on {}", socket.display());
 
@@ -133,6 +137,7 @@ pub fn serve(root: &Path, config: Config) -> Result<()> {
         warm: Arc::new(Mutex::new(None)),
         loading: None,
         busy: None,
+        bound,
     };
     let mut last = Instant::now();
     loop {
@@ -144,6 +149,18 @@ pub fn serve(root: &Path, config: Config) -> Result<()> {
                 last = Instant::now();
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Nobody can reach a daemon whose socket was deleted — its data
+                // directory removed, say — so a recording it holds could never
+                // be stopped. Exit rather than record forever.
+                let gone = match std::fs::metadata(&socket) {
+                    Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+                    // Another daemon's socket at our path: ours is unreachable.
+                    Ok(meta) => identity(&meta) != bound,
+                };
+                if gone {
+                    eprintln!("[daemon] the socket is gone, exiting");
+                    break;
+                }
                 if daemon.recording.is_none() && last.elapsed() > idle_limit {
                     eprintln!("[daemon] idle for {}s, exiting", idle_limit.as_secs());
                     break;
@@ -154,8 +171,22 @@ pub fn serve(root: &Path, config: Config) -> Result<()> {
         }
     }
     daemon.unload();
-    std::fs::remove_file(&socket).ok();
+    // Only our own: a socket another daemon bound at this path is its, alive.
+    remove_own(&socket, bound);
     Ok(())
+}
+
+/// What tells our socket file from another bound later at the same path:
+/// fixed for the file's life, whatever is done to its permissions or times.
+fn identity(meta: &std::fs::Metadata) -> (u64, u64) {
+    (meta.dev(), meta.ino())
+}
+
+/// Remove the socket at `path` only if it is still the one bound as `bound`.
+fn remove_own(path: &Path, bound: (u64, u64)) {
+    if std::fs::metadata(path).is_ok_and(|meta| identity(&meta) == bound) {
+        std::fs::remove_file(path).ok();
+    }
 }
 
 impl Daemon {
@@ -186,8 +217,7 @@ impl Daemon {
             "quit" => {
                 self.recording = None;
                 self.unload();
-                // The accept loop notices the missing socket on its next turn.
-                std::fs::remove_file(socket_path(&self.root)).ok();
+                remove_own(&socket_path(&self.root), self.bound);
                 std::process::exit(0);
             }
             other => bail!("unknown request {other:?}"),
@@ -229,6 +259,7 @@ impl Daemon {
             "elapsed": elapsed,
             "session": self.recording.as_ref().and_then(|r| r.session.clone()),
             "engine": self.recording.as_ref().map(|r| r.engine.as_str()),
+            "device": self.recording.as_ref().map(|r| r.recorder.device.clone()),
             "warm": warm,
         })
     }
@@ -260,12 +291,13 @@ impl Daemon {
             session,
             engine.as_str()
         );
+        let device = recorder.device.clone();
         self.recording = Some(Recording {
             recorder,
             session,
             engine,
         });
-        Ok(json!({ "ok": true, "state": "recording", "engine": engine.as_str() }))
+        Ok(json!({ "ok": true, "state": "recording", "engine": engine.as_str(), "device": device }))
     }
 
     /// Load `engine` on a thread while the user is still talking, unless it is
@@ -314,7 +346,13 @@ impl Daemon {
         }
         let resampled = audio::to_16k(&clip)?;
         let Some(speech) = audio::trim_silence(&resampled) else {
-            return Ok(json!({ "ok": true, "empty": true, "text": "", "chars": 0 }));
+            return Ok(json!({
+                "ok": true,
+                "empty": true,
+                "text": "",
+                "chars": 0,
+                "engine": engine.as_str(),
+            }));
         };
         let audio_s = speech.len() as f64 / audio::RATE as f64;
 
@@ -336,7 +374,7 @@ impl Daemon {
             let _ = loading.join();
         }
         let load_s = load_wait.elapsed().as_secs_f64();
-        let ctx = context::build(&self.config.context.glossary, session);
+        let ctx = context::build(&self.config.context, session);
 
         let started = Instant::now();
         let raw = {
@@ -352,11 +390,20 @@ impl Daemon {
 
         let mut text = raw.clone();
         let mut cleanup_log = None;
+        // What became of the cleanup, for the one line the strip shows.
+        let mut outcome = json!({ "state": "off" });
         if self.config.cleanup.enabled && !raw.is_empty() {
+            // A broken instructions file costs the user's extra rules, never
+            // the dictation.
+            let instructions = self.config.cleanup.user_instructions().unwrap_or_else(|e| {
+                eprintln!("[daemon] cleanup instructions skipped: {e:#}");
+                None
+            });
             match cleanup::run(
                 &self.config.cleanup,
                 self.config.cleanup.backend,
                 ctx.agent.as_deref(),
+                &cleanup::system_prompt(instructions.as_deref()),
                 Some(&ctx.text),
                 &raw,
             ) {
@@ -371,6 +418,12 @@ impl Daemon {
                             .map(|r| format!(" (rejected: {r})"))
                             .unwrap_or_default()
                     );
+                    outcome = match &cleaned.rejected {
+                        Some(why) => {
+                            json!({ "state": "refused", "backend": cleaned.backend, "why": why })
+                        }
+                        None => json!({ "state": "cleaned", "backend": cleaned.backend }),
+                    };
                     text = cleaned.text;
                     cleanup_log = Some(stats::CleanupLog {
                         backend: cleaned.backend,
@@ -383,7 +436,10 @@ impl Daemon {
                     });
                 }
                 // The raw text is still a usable dictation.
-                Err(e) => eprintln!("[daemon] cleanup failed: {e:#}"),
+                Err(e) => {
+                    eprintln!("[daemon] cleanup failed: {e:#}");
+                    outcome = json!({ "state": "failed", "why": format!("{e:#}") });
+                }
             }
         }
 
@@ -418,6 +474,8 @@ impl Daemon {
             "chars": text.chars().count(),
             "audio_s": audio_s,
             "infer_s": infer_s,
+            "engine": engine_id.as_str(),
+            "cleanup": outcome,
         });
         match pasted {
             Some(Ok(())) => reply["pasted"] = json!(true),
