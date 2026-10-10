@@ -123,9 +123,7 @@ pub fn serve(root: &Path, config: Config) -> Result<()> {
         std::fs::remove_file(&socket).ok();
     }
     let listener = UnixListener::bind(&socket).context("bind the daemon socket")?;
-    let bound = std::fs::metadata(&socket)
-        .context("stat the daemon socket")?
-        .ino();
+    let bound = identity(&std::fs::metadata(&socket).context("stat the daemon socket")?);
     listener.set_nonblocking(true)?;
     eprintln!("[daemon] listening on {}", socket.display());
 
@@ -154,7 +152,7 @@ pub fn serve(root: &Path, config: Config) -> Result<()> {
                 let gone = match std::fs::metadata(&socket) {
                     Err(e) => e.kind() == std::io::ErrorKind::NotFound,
                     // Another daemon's socket at our path: ours is unreachable.
-                    Ok(meta) => meta.ino() != bound,
+                    Ok(meta) => identity(&meta) != bound,
                 };
                 if gone {
                     eprintln!("[daemon] the socket is gone, exiting");
@@ -170,8 +168,18 @@ pub fn serve(root: &Path, config: Config) -> Result<()> {
         }
     }
     daemon.unload();
-    std::fs::remove_file(&socket).ok();
+    // Only our own: a socket another daemon bound at this path is its, alive.
+    if std::fs::metadata(&socket).is_ok_and(|meta| identity(&meta) == bound) {
+        std::fs::remove_file(&socket).ok();
+    }
     Ok(())
+}
+
+/// What tells our socket file from another bound later at the same path. The
+/// inode alone can be handed straight back out once freed (ext4 does), so the
+/// device and the change time go with it.
+fn identity(meta: &std::fs::Metadata) -> (u64, u64, i64, i64) {
+    (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec())
 }
 
 impl Daemon {

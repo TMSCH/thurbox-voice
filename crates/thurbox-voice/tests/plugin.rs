@@ -1026,14 +1026,20 @@ fn live_a_daemon_whose_socket_is_gone_exits_even_while_recording() {
 #[test]
 fn a_palette_cancel_or_stop_survives_finding_another_sessions_recording() {
     const RUNNING: &str = r#"{"device":"mic","engine":"parakeet","ok":true,"running":true,"session":"11111111-aaaa","state":"recording"}"#;
-    for (action, then) in [
-        (CANCEL, "thurbox-voice cancel"),
-        ("voice.stop", "thurbox-voice stop"),
+    // Alone, and after a press's own stop (a quick second press) got there
+    // first.
+    for (action, then, press_first) in [
+        (CANCEL, "thurbox-voice cancel", false),
+        ("voice.stop", "thurbox-voice stop", false),
+        ("voice.stop", "thurbox-voice stop", true),
     ] {
         let mut host = Host::new(Keyboard::Releases("reported"));
         host.select("22222222-bbbb");
         host.press();
         host.frame();
+        if press_first {
+            host.press();
+        }
         host.action(action, None);
         host.answer(
             "thurbox-voice start",

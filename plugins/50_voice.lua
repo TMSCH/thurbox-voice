@@ -412,7 +412,11 @@ return {
 
     if action == STOP then
       if state.phase == "starting" then
-        state.pending = state.pending or "asked stop"
+        -- Upgrades a press's own stop, so the takeover guard keeps it; never
+        -- downgrades a cancel.
+        if state.pending ~= "cancel" then
+          state.pending = "asked stop"
+        end
       elseif state.phase == "recording" then
         state.phase = "stopping"
         queue("stop", BIN .. " stop")
