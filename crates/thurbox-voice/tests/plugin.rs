@@ -512,6 +512,33 @@ fn a_cancel_while_the_start_is_pending_waits_for_it_too() {
 }
 
 #[test]
+fn a_cancel_while_starting_is_not_undone_by_a_later_press_or_release() {
+    for hold in [false, true] {
+        let mut host = Host::new(Keyboard::Releases("reported"));
+        if hold {
+            host.set("mode", "hold");
+        }
+        host.press();
+        host.frame();
+        host.action(CANCEL, None);
+        if hold {
+            host.release();
+        } else {
+            host.press();
+        }
+        host.frame();
+        host.answer("thurbox-voice start", true, "recording with parakeet", "");
+        host.frame();
+        assert_eq!(
+            host.stops(),
+            0,
+            "a cancelled recording is never transcribed"
+        );
+        assert_eq!(host.programs().last().unwrap(), "thurbox-voice cancel");
+    }
+}
+
+#[test]
 fn a_failed_start_leaves_nothing_pending() {
     let mut host = Host::new(Keyboard::Releases("reported"));
     host.set("mode", "hold");

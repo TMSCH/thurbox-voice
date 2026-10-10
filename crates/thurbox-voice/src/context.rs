@@ -105,7 +105,9 @@ pub fn build(config: &ContextConfig, session: Option<&str>) -> Context {
         String::new()
     };
     let screen = match session {
-        Some(id) if config.uses(Source::Screen) => screen(id, config.screen_lines),
+        Some(id) if config.uses(Source::Screen) => {
+            cap_screen(screen(id, config.screen_lines), SCREEN_CHARS)
+        }
         _ => Vec::new(),
     };
 
@@ -150,6 +152,20 @@ fn memory(files: &[String]) -> String {
         }
     }
     out
+}
+
+/// The most screen sent, whatever `max_chars` leaves room for: the cap a
+/// dictation had before the budget existed, so an unchanged config sends no
+/// more of a session's screen than it did.
+const SCREEN_CHARS: usize = 4000;
+
+/// The newest lines of `screen` that fit in `chars`.
+fn cap_screen(mut screen: Vec<String>, chars: usize) -> Vec<String> {
+    let size = |lines: &[String]| lines.iter().map(|l| l.chars().count() + 1).sum::<usize>();
+    while size(&screen) > chars + 1 && !screen.is_empty() {
+        screen.remove(0);
+    }
+    screen
 }
 
 const SCREEN_HEADING: &str = "The agent's screen, most recent last:";
@@ -244,6 +260,20 @@ mod tests {
         assert!(context.vocabulary.contains("Spotpay"));
         assert!(context.text.contains("thurbox"));
         assert!(context.agent.is_none());
+    }
+
+    #[test]
+    fn the_screen_keeps_its_own_cap_inside_the_budget() {
+        // What a config with no [context] section sent before sources existed:
+        // never more than SCREEN_CHARS of screen, newest lines kept.
+        let screen: Vec<String> = (0..60)
+            .map(|i| format!("{i:03} {}", "x".repeat(146)))
+            .collect();
+        let text = fit("", "", &cap_screen(screen, SCREEN_CHARS), 8000);
+        let shown = text.split_once('\n').unwrap().1;
+        assert!(shown.chars().count() <= SCREEN_CHARS, "{}", shown.len());
+        assert!(shown.ends_with(&"x".repeat(146)) && shown.contains("059 "));
+        assert!(!shown.contains("000 "));
     }
 
     #[test]

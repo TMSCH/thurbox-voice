@@ -311,7 +311,7 @@ return {
       if event == "release" then
         -- Only a hold ends on a release; a toggle's own release is noise.
         if state.hold and state.phase == "starting" then
-          state.pending = "stop"
+          state.pending = state.pending or "stop"
         elseif state.hold and state.phase == "recording" then
           state.phase = "stopping"
           queue("stop", BIN .. " stop")
@@ -340,8 +340,9 @@ return {
         )
       elseif state.phase == "starting" then
         -- A second press always stops, in either mode: it is also what ends a
-        -- hold whose release never arrived.
-        state.pending = "stop"
+        -- hold whose release never arrived. A cancel already asked for stays
+        -- a cancel: what the user threw away is never transcribed.
+        state.pending = state.pending or "stop"
       elseif state.phase == "recording" then
         state.phase = "stopping"
         queue("stop", BIN .. " stop")

@@ -395,9 +395,12 @@ fn stop_line(reply: &serde_json::Value) -> Result<String> {
         return Ok(format!("no speech heard{label}"));
     }
     let cleanup = &reply["cleanup"];
-    let why = cleanup["why"].as_str().unwrap_or("");
+    let why = brief(cleanup["why"].as_str().unwrap_or(""));
     let cleanup = match cleanup["state"].as_str() {
-        Some("cleaned") => format!(" · cleanup {}", cleanup["backend"].as_str().unwrap_or("?")),
+        Some("cleaned") => format!(
+            " · cleanup {}",
+            backend_name(cleanup["backend"].as_str().unwrap_or("?"))
+        ),
         Some("refused") => format!(" · raw (cleanup refused: {why})"),
         Some("failed") => format!(" · raw (cleanup failed: {why})"),
         Some("off") => " · raw (cleanup off)".to_string(),
@@ -413,6 +416,30 @@ fn stop_line(reply: &serde_json::Value) -> Result<String> {
     } else {
         Ok(reply["text"].as_str().unwrap_or("").to_string())
     }
+}
+
+/// The backend as the one-line strip names it. An agent command is cut to its
+/// program's name: its argv can be long, and can carry a key of its own.
+fn backend_name(label: &str) -> String {
+    match label.strip_prefix("agent:") {
+        Some(argv) => {
+            let program = argv.split_whitespace().next().unwrap_or("?");
+            format!("agent:{}", program.rsplit('/').next().unwrap_or(program))
+        }
+        None => label.to_string(),
+    }
+}
+
+/// A reason short enough for the strip: its first line, cut at a width that
+/// leaves the session name in view. `daemon.log` keeps the whole of it.
+fn brief(why: &str) -> String {
+    const WIDTH: usize = 80;
+    let line = why.lines().next().unwrap_or("").trim();
+    if line.chars().count() <= WIDTH {
+        return line.to_string();
+    }
+    let cut: String = line.chars().take(WIDTH).collect();
+    format!("{}…", cut.trim_end())
 }
 
 /// One request to the daemon; a refusal becomes an error, so the exit status
@@ -579,6 +606,31 @@ mod tests {
             stop_line(&reply).unwrap(),
             "no speech heard · Parakeet TDT 0.6B v3"
         );
+    }
+
+    #[test]
+    fn the_strip_gets_a_short_cleanup_label_and_never_an_argv() {
+        let reply = json!({
+            "ok": true, "text": "hi", "chars": 2, "pasted": true, "engine": "parakeet",
+            "cleanup": { "state": "cleaned",
+                         "backend": "agent:/usr/bin/llm --key sk-secret --model x" },
+        });
+        assert_eq!(
+            stop_line(&reply).unwrap(),
+            "dictated 2 chars · Parakeet TDT 0.6B v3 · cleanup agent:llm"
+        );
+        let long = format!("claude exited with 1: {}\nsecond line", "x".repeat(200));
+        let reply = json!({
+            "ok": true, "text": "hi", "chars": 2, "pasted": true, "engine": "parakeet",
+            "cleanup": { "state": "failed", "why": long },
+        });
+        let line = stop_line(&reply).unwrap();
+        assert!(
+            !line.contains('\n') && !line.contains("second line"),
+            "{line}"
+        );
+        assert!(line.ends_with("…)"), "a cut reason still closes: {line}");
+        assert!(line.chars().count() < 160, "{line}");
     }
 
     #[test]

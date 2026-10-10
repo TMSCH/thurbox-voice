@@ -165,7 +165,7 @@ codex_model = "luna"        # a family, resolved against Codex's catalog
 [context]
 glossary = ["Spotpay", "payouts", "ledger"]   # your own words
 sources = ["glossary", "session", "screen", "memory"]   # drop one to stop sending it
-screen_lines = 60           # of the captured session's screen
+screen_lines = 60           # of the captured session's screen, at most 4000 chars
 memory_files = []           # your own notes, at most 4000 chars each
 max_chars = 8000            # the whole context, cut oldest screen lines first
 ```
