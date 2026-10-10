@@ -29,6 +29,10 @@ impl Clip {
 
 /// A recording in progress. The cpal stream is not `Send` on every platform,
 /// so it lives on a thread of its own and this handle only talks to it.
+/// `THURBOX_VOICE_TEST_INPUT=quiet` replaces the microphone with
+/// [`Recorder::quiet`], which is how the end-to-end tests drive a real daemon.
+pub const TEST_INPUT: &str = "THURBOX_VOICE_TEST_INPUT";
+
 pub struct Recorder {
     stop: std::sync::mpsc::Sender<()>,
     thread: std::thread::JoinHandle<()>,
@@ -42,6 +46,9 @@ impl Recorder {
     /// Open the default input device and start filling the buffer. Returns
     /// once the stream is running, or with the reason it could not start.
     pub fn start() -> Result<Self> {
+        if std::env::var_os(TEST_INPUT).is_some_and(|v| v == "quiet") {
+            return Ok(Self::quiet());
+        }
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(u32, String)>>();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
         let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
@@ -72,6 +79,36 @@ impl Recorder {
             device,
             started: Instant::now(),
         })
+    }
+
+    /// A stand-in microphone for tests: a noise floor under the speech gate,
+    /// so a recording starts and stops like a real one, transcribes to "no
+    /// speech heard", and no device is ever opened.
+    fn quiet() -> Self {
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+        let shared = Arc::clone(&buffer);
+        let thread = std::thread::spawn(move || {
+            let mut sign = 1.0;
+            while stop_rx
+                .recv_timeout(std::time::Duration::from_millis(20))
+                .is_err()
+            {
+                let mut samples = shared.lock().unwrap();
+                for _ in 0..(RATE as usize / 50) {
+                    sign = -sign;
+                    samples.push(sign * GATE / 10.0);
+                }
+            }
+        });
+        Self {
+            stop: stop_tx,
+            thread,
+            buffer,
+            rate: RATE,
+            device: "test input (quiet)".to_string(),
+            started: Instant::now(),
+        }
     }
 
     /// Stop recording and hand back everything captured.

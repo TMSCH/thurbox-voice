@@ -299,13 +299,17 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Cancel => {
-            client(
+            let reply = client(
                 &root,
                 &serde_json::json!({ "cmd": "cancel" }),
                 false,
                 Duration::from_secs(5),
             )?;
-            println!("cancelled");
+            if reply["cancelled"] == false {
+                println!("nothing to cancel");
+            } else {
+                println!("cancelled");
+            }
             Ok(())
         }
         Command::Status => {

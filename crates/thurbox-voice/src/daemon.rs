@@ -229,6 +229,7 @@ impl Daemon {
             "elapsed": elapsed,
             "session": self.recording.as_ref().and_then(|r| r.session.clone()),
             "engine": self.recording.as_ref().map(|r| r.engine.as_str()),
+            "device": self.recording.as_ref().map(|r| r.recorder.device.clone()),
             "warm": warm,
         })
     }
@@ -260,12 +261,13 @@ impl Daemon {
             session,
             engine.as_str()
         );
+        let device = recorder.device.clone();
         self.recording = Some(Recording {
             recorder,
             session,
             engine,
         });
-        Ok(json!({ "ok": true, "state": "recording", "engine": engine.as_str() }))
+        Ok(json!({ "ok": true, "state": "recording", "engine": engine.as_str(), "device": device }))
     }
 
     /// Load `engine` on a thread while the user is still talking, unless it is

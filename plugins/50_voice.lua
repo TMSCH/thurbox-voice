@@ -121,9 +121,62 @@ local function first_line(text)
   return (line:gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
+--- The name the strip uses for a session id, from the current snapshot.
+local function session_name(id)
+  for _, session in ipairs(thurbox and thurbox.sessions or {}) do
+    if session.id == id then
+      return session.name or session.id
+    end
+  end
+  return id
+end
+
+--- The recording is running: send whatever was asked for while it started.
+--- Sent alongside the start, a stop or cancel could reach the daemon first and
+--- leave the microphone on.
+local function began()
+  state.phase = "recording"
+  state.since = nil
+  local pending = state.pending
+  state.pending = nil
+  if pending == "stop" then
+    state.phase = "stopping"
+    queue("stop", BIN .. " stop")
+  elseif pending == "cancel" then
+    state.phase = "cancelling"
+    queue("cancel", BIN .. " cancel")
+  end
+end
+
 local function settle(ask, answer)
   local out = first_line(answer.stdout)
   local err = first_line(answer.stderr)
+  -- The daemon is recording already, for a pane that no longer knows it — an
+  -- interface reload starts this file over with empty state. Ask what it is
+  -- recording and take it over, so the shortcut and cancel reach it again.
+  if ask.verb == "start" and not answer.ok and err:match("already recording") then
+    queue("status", BIN .. " status")
+    return
+  end
+  if ask.verb == "status" then
+    local status = answer.stdout or ""
+    if status:match('"state":"recording"') then
+      state.engine = status:match('"engine":"([%w_-]+)"') or state.engine
+      local id = status:match('"session":"([^"]+)"')
+      state.session_name = id and session_name(id) or "session"
+      began()
+      return
+    end
+    state.phase = nil
+    state.pending = nil
+    outcome("the earlier recording has ended", "muted")
+    return
+  end
+  if ask.verb == "cancel" and (out == "nothing to cancel" or err:match("not recording")) then
+    state.phase = nil
+    outcome("not recording", "muted")
+    return
+  end
   if answer.state == "failed" or not answer.ok then
     state.phase = nil
     state.pending = nil
@@ -135,20 +188,7 @@ local function settle(ask, answer)
     return
   end
   if ask.verb == "start" then
-    state.phase = "recording"
-    state.since = nil
-    -- A stop or cancel asked for while the start was in flight goes now, after
-    -- it: sent alongside, it could reach the daemon first and leave the
-    -- microphone on.
-    local pending = state.pending
-    state.pending = nil
-    if pending == "stop" then
-      state.phase = "stopping"
-      queue("stop", BIN .. " stop")
-    elseif pending == "cancel" then
-      state.phase = "cancelling"
-      queue("cancel", BIN .. " cancel")
-    end
+    began()
     return
   end
   state.phase = nil
@@ -353,11 +393,11 @@ return {
     if action == CANCEL then
       if state.phase == "starting" then
         state.pending = "cancel"
-      elseif state.phase == "recording" then
+      elseif state.phase == "recording" or state.phase == nil then
+        -- Asked of the daemon even when this pane saw no recording start: it
+        -- may be holding one this pane lost track of.
         state.phase = "cancelling"
         queue("cancel", BIN .. " cancel")
-      else
-        outcome("not recording", "muted")
       end
       return true
     end

@@ -9,8 +9,11 @@
 //! ever started: a `run` is recorded and answered by the test.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use mlua::{Function, Lua, Table, Value};
 
@@ -51,6 +54,9 @@ enum Keyboard {
 
 type Runs = Rc<RefCell<Vec<(String, String)>>>;
 
+/// Answers from programs a live host really ran: key, ok, stdout, stderr.
+type Finished = Arc<Mutex<Vec<(String, bool, String, String)>>>;
+
 struct Host {
     lua: Lua,
     plugin: Table,
@@ -58,6 +64,8 @@ struct Host {
     runs: Runs,
     keyboard: Keyboard,
     now: f64,
+    /// Set when `run` executes programs for real, against a [`Daemon`].
+    finished: Option<Finished>,
 }
 
 fn thurbox(lua: &Lua) -> Table {
@@ -74,6 +82,17 @@ fn registry(lua: &Lua, field: &str) -> Table {
 
 impl Host {
     fn new(keyboard: Keyboard) -> Self {
+        Self::with(keyboard, None)
+    }
+
+    /// A host whose `run` starts each program the way thurbox does — `sh -c`,
+    /// on a thread, the answer published when it exits — against `daemon`'s
+    /// isolated install.
+    fn live(keyboard: Keyboard, daemon: &Daemon) -> Self {
+        Self::with(keyboard, Some(daemon.env()))
+    }
+
+    fn with(keyboard: Keyboard, env: Option<Vec<(String, String)>>) -> Self {
         let lua = Lua::new();
         lua.load(LIBS).exec().unwrap();
         let globals = lua.globals();
@@ -103,6 +122,8 @@ impl Host {
 
         let runs: Runs = Rc::default();
         let seen = Rc::clone(&runs);
+        let finished: Option<Finished> = env.as_ref().map(|_| Finished::default());
+        let done = finished.clone();
         let run = lua
             .create_function(move |lua, (key, program, _opts): (String, String, Value)| {
                 let answers: Table = thurbox(lua).get("runs")?;
@@ -110,7 +131,24 @@ impl Host {
                     let pending = lua.create_table()?;
                     pending.set("state", "pending")?;
                     answers.set(key.as_str(), pending)?;
-                    seen.borrow_mut().push((key, program));
+                    seen.borrow_mut().push((key.clone(), program.clone()));
+                    if let (Some(env), Some(done)) = (env.clone(), done.clone()) {
+                        std::thread::spawn(move || {
+                            let output = Command::new("sh")
+                                .arg("-c")
+                                .arg(&program)
+                                .env_clear()
+                                .envs(env)
+                                .output()
+                                .unwrap();
+                            done.lock().unwrap().push((
+                                key,
+                                output.status.success(),
+                                String::from_utf8_lossy(&output.stdout).into_owned(),
+                                String::from_utf8_lossy(&output.stderr).into_owned(),
+                            ));
+                        });
+                    }
                 }
                 Ok(())
             })
@@ -165,6 +203,7 @@ impl Host {
             runs,
             keyboard,
             now: 0.0,
+            finished,
         }
     }
 
@@ -224,6 +263,22 @@ impl Host {
     /// One frame: the pane starts whatever it queued, and says what it shows.
     fn frame(&mut self) -> String {
         self.now += 0.5;
+        let exited: Vec<_> = self
+            .finished
+            .as_ref()
+            .map(|f| std::mem::take(&mut *f.lock().unwrap()))
+            .unwrap_or_default();
+        let answers: Table = thurbox(&self.lua).get("runs").unwrap();
+        for (key, ok, stdout, stderr) in exited {
+            let answer = self.lua.create_table().unwrap();
+            answer
+                .set("state", if ok { "done" } else { "failed" })
+                .unwrap();
+            answer.set("ok", ok).unwrap();
+            answer.set("stdout", stdout).unwrap();
+            answer.set("stderr", stderr).unwrap();
+            answers.set(key.as_str(), answer).unwrap();
+        }
         let render: Function = self.plugin.get("render").unwrap();
         let ctx = self.lua.create_table().unwrap();
         ctx.set("elapsed", self.now).unwrap();
@@ -307,8 +362,14 @@ fn set_setting(lua: &Lua, plugin: &str, id: &str, value: Value) -> mlua::Result<
     settings.push(entry)
 }
 
+/// `THURBOX_VOICE_PANE` runs these tests against another copy of the pane — an
+/// older release, to show a regression test fails without its fix.
 fn pane_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/50_voice.lua")
+    std::env::var_os("THURBOX_VOICE_PANE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/50_voice.lua")
+        })
 }
 
 fn choices(setting: &Table) -> Vec<String> {
@@ -647,4 +708,223 @@ fn the_mode_in_force_is_captured_at_start() {
     host.release();
     host.frame();
     assert_eq!(host.stops(), 1, "the release of a hold still stops it");
+}
+
+// ── live: the pane driving the real helper and daemon ───────────────────────
+
+/// An isolated `thurbox-voice` install: its own data directory and config, a
+/// quiet stand-in microphone, cleanup off, and a `thurbox-cli` that refuses
+/// everything, so no real session can be touched. The models are sparse files
+/// of the pinned sizes: present as far as `start` checks, never loaded, since
+/// a quiet recording has no speech to transcribe.
+struct Daemon {
+    home: PathBuf,
+}
+
+/// The Parakeet files `start` checks for, at their pinned sizes.
+const PARAKEET_FILES: &[(&str, u64)] = &[
+    ("encoder-model.int8.onnx", 652_183_999),
+    ("decoder_joint-model.int8.onnx", 18_202_004),
+    ("nemo128.onnx", 139_764),
+    ("vocab.txt", 93_939),
+];
+
+impl Daemon {
+    fn new(name: &str) -> Self {
+        // A Unix socket path is capped near 100 bytes, which a target
+        // directory under a deep checkout can exceed; HOME's cache is short.
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap())
+            .join(".cache/thurbox-voice-tests")
+            .join(format!("{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let models = home.join("models/parakeet");
+        std::fs::create_dir_all(&models).unwrap();
+        for (file, size) in PARAKEET_FILES {
+            std::fs::File::create(models.join(file))
+                .unwrap()
+                .set_len(*size)
+                .unwrap();
+        }
+        std::fs::write(home.join("config.toml"), "[cleanup]\nenabled = false\n").unwrap();
+        let bin = home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let stub = bin.join("thurbox-cli");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\necho 'thurbox-cli is stubbed in tests' >&2\nexit 1\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&stub).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&stub, perms).unwrap();
+        Daemon { home }
+    }
+
+    fn env(&self) -> Vec<(String, String)> {
+        let helper = Path::new(env!("CARGO_BIN_EXE_thurbox-voice"))
+            .parent()
+            .unwrap();
+        let path = format!(
+            "{}:{}:{}",
+            self.home.join("bin").display(),
+            helper.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let home = self.home.display().to_string();
+        vec![
+            ("PATH".into(), path),
+            ("HOME".into(), home.clone()),
+            ("THURBOX_VOICE_HOME".into(), home.clone()),
+            ("THURBOX_VOICE_CONFIG".into(), format!("{home}/config.toml")),
+            ("THURBOX_VOICE_TEST_INPUT".into(), "quiet".into()),
+            // Belt and braces: should the stand-in ever not be taken, no
+            // audio system is reachable from here either.
+            ("ALSA_CONFIG_PATH".into(), format!("{home}/no-alsa.conf")),
+            ("PULSE_SERVER".into(), format!("unix:{home}/no-pulse")),
+            ("PIPEWIRE_REMOTE".into(), format!("{home}/no-pipewire")),
+        ]
+    }
+
+    fn cli(&self, args: &[&str]) -> String {
+        let output = Command::new(env!("CARGO_BIN_EXE_thurbox-voice"))
+            .args(args)
+            .env_clear()
+            .envs(self.env())
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// What the daemon itself says: the ground truth a strip can disagree with.
+    fn status(&self) -> serde_json::Value {
+        serde_json::from_str(self.cli(&["status"]).trim()).unwrap()
+    }
+
+    fn recording(&self) -> bool {
+        let status = self.status();
+        if status["state"] == "recording" {
+            assert_eq!(
+                status["device"], "test input (quiet)",
+                "never a real microphone"
+            );
+            return true;
+        }
+        false
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        self.cli(&["quit"]);
+        let _ = std::fs::remove_dir_all(&self.home);
+    }
+}
+
+impl Host {
+    /// Frames until the strip shows `wanted`, the way thurbox keeps rendering
+    /// while programs run.
+    fn until(&mut self, wanted: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let shown = self.frame();
+            if shown.contains(wanted) {
+                return shown;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the strip never showed {wanted:?}; last: {shown:?}; ran {:?}",
+                self.programs()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+#[test]
+fn live_a_second_press_while_starting_stops_the_recording() {
+    let daemon = Daemon::new("second-press");
+    let mut host = Host::live(Keyboard::Releases("unsupported"), &daemon);
+    host.press();
+    host.frame();
+    // The start is still launching the daemon: the user, or a terminal's
+    // auto-repeat, presses again.
+    host.press();
+    host.until("no speech heard");
+    assert!(!daemon.recording(), "the microphone was left on");
+    // And the shortcut still works afterwards.
+    host.press();
+    host.until("REC");
+    assert!(daemon.recording());
+    host.press();
+    host.until("no speech heard");
+    assert!(!daemon.recording());
+}
+
+#[test]
+fn live_a_hold_released_before_the_start_finishes_stops_it() {
+    let daemon = Daemon::new("hold-release");
+    let mut host = Host::live(Keyboard::Releases("reported"), &daemon);
+    host.set("mode", "hold");
+    host.press();
+    host.frame();
+    host.release();
+    host.until("no speech heard");
+    assert!(!daemon.recording());
+}
+
+#[test]
+fn live_cancel_while_starting_discards_the_recording() {
+    let daemon = Daemon::new("cancel");
+    let mut host = Host::live(Keyboard::Releases("reported"), &daemon);
+    host.press();
+    host.frame();
+    host.action(CANCEL, None);
+    host.until("discarded");
+    assert!(!daemon.recording());
+}
+
+#[test]
+fn live_stop_works_after_the_selection_moves() {
+    let daemon = Daemon::new("focus");
+    let mut host = Host::live(Keyboard::Releases("reported"), &daemon);
+    host.press();
+    host.until("REC");
+    host.select("22222222-bbbb");
+    assert!(host.frame().contains("→ api"));
+    host.press();
+    host.until("no speech heard");
+    assert!(!daemon.recording());
+}
+
+#[test]
+fn live_a_pane_that_lost_track_of_a_recording_can_still_stop_it() {
+    let daemon = Daemon::new("reload");
+    {
+        let mut before = Host::live(Keyboard::Releases("reported"), &daemon);
+        before.press();
+        before.until("REC");
+    }
+    // An interface reload starts the pane over with empty state while the
+    // daemon is still recording.
+    assert!(daemon.recording());
+    let mut host = Host::live(Keyboard::Releases("reported"), &daemon);
+    host.press();
+    host.until("REC");
+    host.press();
+    host.until("no speech heard");
+    assert!(!daemon.recording());
+}
+
+#[test]
+fn live_cancel_reaches_a_recording_the_pane_lost_track_of() {
+    let daemon = Daemon::new("reload-cancel");
+    {
+        let mut before = Host::live(Keyboard::Releases("reported"), &daemon);
+        before.press();
+        before.until("REC");
+    }
+    let mut host = Host::live(Keyboard::Releases("reported"), &daemon);
+    host.action(CANCEL, None);
+    host.until("discarded");
+    assert!(!daemon.recording());
 }
