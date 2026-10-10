@@ -24,6 +24,21 @@ impl EngineId {
             EngineId::Whisper => "whisper",
         }
     }
+
+    /// The model behind the id, as the strip and `stop` name it — the speech
+    /// model, as against the cleanup model that may run after it.
+    pub fn label(self) -> &'static str {
+        match self {
+            EngineId::Parakeet => "Parakeet TDT 0.6B v3",
+            EngineId::Whisper => "Whisper large-v3-turbo",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        [EngineId::Parakeet, EngineId::Whisper]
+            .into_iter()
+            .find(|id| id.as_str() == name)
+    }
 }
 
 pub enum Engine {

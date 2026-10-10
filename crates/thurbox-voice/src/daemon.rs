@@ -314,7 +314,13 @@ impl Daemon {
         }
         let resampled = audio::to_16k(&clip)?;
         let Some(speech) = audio::trim_silence(&resampled) else {
-            return Ok(json!({ "ok": true, "empty": true, "text": "", "chars": 0 }));
+            return Ok(json!({
+                "ok": true,
+                "empty": true,
+                "text": "",
+                "chars": 0,
+                "engine": engine.as_str(),
+            }));
         };
         let audio_s = speech.len() as f64 / audio::RATE as f64;
 
@@ -336,7 +342,7 @@ impl Daemon {
             let _ = loading.join();
         }
         let load_s = load_wait.elapsed().as_secs_f64();
-        let ctx = context::build(&self.config.context.glossary, session);
+        let ctx = context::build(&self.config.context, session);
 
         let started = Instant::now();
         let raw = {
@@ -352,11 +358,20 @@ impl Daemon {
 
         let mut text = raw.clone();
         let mut cleanup_log = None;
+        // What became of the cleanup, for the one line the strip shows.
+        let mut outcome = json!({ "state": "off" });
         if self.config.cleanup.enabled && !raw.is_empty() {
+            // A broken instructions file costs the user's extra rules, never
+            // the dictation.
+            let instructions = self.config.cleanup.user_instructions().unwrap_or_else(|e| {
+                eprintln!("[daemon] cleanup instructions skipped: {e:#}");
+                None
+            });
             match cleanup::run(
                 &self.config.cleanup,
                 self.config.cleanup.backend,
                 ctx.agent.as_deref(),
+                &cleanup::system_prompt(instructions.as_deref()),
                 Some(&ctx.text),
                 &raw,
             ) {
@@ -371,6 +386,12 @@ impl Daemon {
                             .map(|r| format!(" (rejected: {r})"))
                             .unwrap_or_default()
                     );
+                    outcome = match &cleaned.rejected {
+                        Some(why) => {
+                            json!({ "state": "refused", "backend": cleaned.backend, "why": why })
+                        }
+                        None => json!({ "state": "cleaned", "backend": cleaned.backend }),
+                    };
                     text = cleaned.text;
                     cleanup_log = Some(stats::CleanupLog {
                         backend: cleaned.backend,
@@ -383,7 +404,10 @@ impl Daemon {
                     });
                 }
                 // The raw text is still a usable dictation.
-                Err(e) => eprintln!("[daemon] cleanup failed: {e:#}"),
+                Err(e) => {
+                    eprintln!("[daemon] cleanup failed: {e:#}");
+                    outcome = json!({ "state": "failed", "why": format!("{e:#}") });
+                }
             }
         }
 
@@ -418,6 +442,8 @@ impl Daemon {
             "chars": text.chars().count(),
             "audio_s": audio_s,
             "infer_s": infer_s,
+            "engine": engine_id.as_str(),
+            "cleanup": outcome,
         });
         match pasted {
             Some(Ok(())) => reply["pasted"] = json!(true),

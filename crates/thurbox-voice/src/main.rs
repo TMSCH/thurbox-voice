@@ -64,8 +64,19 @@ enum Command {
         #[command(flatten)]
         cleanup: CleanupArgs,
     },
-    /// Show where the config file is and which cleanup backend would be used.
+    /// Show the config file, the cleanup backend, and what context is sent.
     Config,
+    /// Print exactly what the cleanup provider would be given — the system
+    /// prompt and the user message — without calling it.
+    Prompt {
+        /// The transcript to build the prompt around.
+        #[arg(default_value = "(your dictation)")]
+        text: String,
+        /// Build the context for this thurbox session, as a dictation into it
+        /// would.
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// Summarise compare.jsonl per engine and per cleanup backend.
     Stats,
     /// Start recording (launching the daemon if needed). Returns at once.
@@ -106,6 +117,10 @@ struct CleanupArgs {
     /// agent's last screen, a glossary. Names in it win over near-misses.
     #[arg(long)]
     context_file: Option<PathBuf>,
+    /// Build the context for this thurbox session, as a dictation into it
+    /// would — its metadata and screen, per `[context] sources`.
+    #[arg(long)]
+    session: Option<String>,
 }
 
 impl CleanupArgs {
@@ -120,17 +135,23 @@ impl CleanupArgs {
     /// The plan whether or not cleanup is on — what `cleanup` runs, since
     /// asking for it by name is asking for it.
     fn plan_always(&self, config: &config::Config) -> Result<Plan> {
+        let built = context::build(&config.context, self.session.as_deref());
+        // As in a dictation: a broken instructions file is reported and the
+        // built-in rules go out alone. `prompt` is where it is an error.
+        let instructions = config.cleanup.user_instructions().unwrap_or_else(|e| {
+            eprintln!("[cleanup] instructions skipped: {e:#}");
+            None
+        });
         Ok(Plan {
             backend: self.backend.unwrap_or(config.cleanup.backend),
-            agent: self.agent.clone(),
-            context: Some(self.context(config)?),
+            agent: self.agent.clone().or(built.agent),
+            system: cleanup::system_prompt(instructions.as_deref()),
+            context: Some(self.extend(built.text)?),
         })
     }
 
-    /// The same context a dictation through thurbox gets — the built-in
-    /// thurbox vocabulary and the user's glossary — plus `--context-file`.
-    fn context(&self, config: &config::Config) -> Result<String> {
-        let mut context = context::build(&config.context.glossary, None).text;
+    /// The context a dictation through thurbox gets, plus `--context-file`.
+    fn extend(&self, mut context: String) -> Result<String> {
         if let Some(path) = &self.context_file {
             let extra = std::fs::read_to_string(path)
                 .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
@@ -144,6 +165,7 @@ impl CleanupArgs {
 struct Plan {
     backend: Backend,
     agent: Option<String>,
+    system: String,
     context: Option<String>,
 }
 
@@ -153,6 +175,7 @@ impl Plan {
             &config.cleanup,
             self.backend,
             self.agent.as_deref(),
+            &self.system,
             self.context.as_deref(),
             raw,
         )?;
@@ -240,16 +263,16 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Config => {
-            let path = config::path();
-            let state = if path.exists() {
-                ""
-            } else {
-                " (absent — defaults in use)"
-            };
-            println!("config: {}{state}", path.display());
-            println!("data:   {}", root.display());
-            println!("cleanup enabled: {}", config.cleanup.enabled);
-            println!("cleanup backend: {:?}", config.cleanup.backend);
+            print_config(&root, &config);
+            Ok(())
+        }
+        Command::Prompt { text, session } => {
+            let instructions = config.cleanup.user_instructions()?;
+            let built = context::build(&config.context, session.as_deref());
+            println!("── system prompt ──");
+            println!("{}", cleanup::system_prompt(instructions.as_deref()));
+            println!("── user message ──");
+            println!("{}", cleanup::user_message(Some(&built.text), &text));
             Ok(())
         }
         Command::Stats => stats::print(&root),
@@ -262,24 +285,17 @@ fn main() -> Result<()> {
                 ask["engine"] = engine.as_str().into();
             }
             let reply = client(&root, &ask, true, Duration::from_secs(10))?;
-            println!("recording with {}", reply["engine"].as_str().unwrap_or("?"));
+            let engine = reply["engine"].as_str().unwrap_or("?");
+            match EngineId::parse(engine) {
+                Some(id) => println!("recording with {engine} ({})", id.label()),
+                None => println!("recording with {engine}"),
+            }
             Ok(())
         }
         Command::Stop => {
             let ask = serde_json::json!({ "cmd": "stop" });
             let reply = client(&root, &ask, false, Duration::from_secs(120))?;
-            if reply["empty"] == true || reply["text"].as_str() == Some("") {
-                println!("no speech heard");
-            } else if reply["pasted"] == true {
-                println!("dictated {} chars", reply["chars"]);
-            } else if let Some(why) = reply["paste_error"].as_str() {
-                bail!(
-                    "transcribed but not pasted ({why}): {}",
-                    reply["text"].as_str().unwrap_or("")
-                );
-            } else {
-                println!("{}", reply["text"].as_str().unwrap_or(""));
-            }
+            println!("{}", stop_line(&reply)?);
             Ok(())
         }
         Command::Cancel => {
@@ -315,6 +331,87 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Daemon => daemon::serve(&root, config),
+    }
+}
+
+/// `config`: where things are, and everything a dictation sends and to whom.
+fn print_config(root: &Path, config: &config::Config) {
+    let path = config::path();
+    let state = if path.exists() {
+        ""
+    } else {
+        " (absent — defaults in use)"
+    };
+    println!("config: {}{state}", path.display());
+    println!("data:   {}", root.display());
+    println!("cleanup enabled: {}", config.cleanup.enabled);
+    println!("cleanup backend: {:?}", config.cleanup.backend);
+    let exists = |file: &str| {
+        let path = config::expand(file);
+        let state = if path.is_file() { "found" } else { "missing" };
+        format!("{} ({state})", path.display())
+    };
+    match (
+        &config.cleanup.instructions,
+        &config.cleanup.instructions_file,
+    ) {
+        (None, None) => println!("cleanup instructions: built-in rules only"),
+        (inline, file) => {
+            if inline.is_some() {
+                println!("cleanup instructions: [cleanup] instructions");
+            }
+            if let Some(file) = file {
+                println!("cleanup instructions file: {}", exists(file));
+            }
+        }
+    }
+    let sources: Vec<&str> = config.context.sources.iter().map(|s| s.as_str()).collect();
+    println!("context sources: {}", sources.join(", "));
+    println!(
+        "context budget: {} chars, screen {} lines",
+        config.context.max_chars, config.context.screen_lines
+    );
+    if config.context.memory_files.is_empty() {
+        println!("memory files: none");
+    }
+    for file in &config.context.memory_files {
+        println!("memory file: {}", exists(file));
+    }
+    println!(
+        "sent to the cleanup backend: the transcript, the rules above and the context \
+         sources listed — `thurbox-voice prompt --session <id>` prints it exactly"
+    );
+}
+
+/// The one line `stop` prints, which is what the strip shows: what was done,
+/// with which speech model, and what became of the cleanup.
+fn stop_line(reply: &serde_json::Value) -> Result<String> {
+    let label = reply["engine"]
+        .as_str()
+        .and_then(EngineId::parse)
+        .map(|id| format!(" · {}", id.label()))
+        .unwrap_or_default();
+    if reply["empty"] == true || reply["text"].as_str() == Some("") {
+        return Ok(format!("no speech heard{label}"));
+    }
+    let cleanup = &reply["cleanup"];
+    let why = cleanup["why"].as_str().unwrap_or("");
+    let cleanup = match cleanup["state"].as_str() {
+        Some("cleaned") => format!(" · cleanup {}", cleanup["backend"].as_str().unwrap_or("?")),
+        Some("refused") => format!(" · raw (cleanup refused: {why})"),
+        Some("failed") => format!(" · raw (cleanup failed: {why})"),
+        Some("off") => " · raw (cleanup off)".to_string(),
+        _ => String::new(),
+    };
+    if reply["pasted"] == true {
+        Ok(format!("dictated {} chars{label}{cleanup}", reply["chars"]))
+    } else if let Some(why) = reply["paste_error"].as_str() {
+        bail!(
+            "transcribed but not pasted ({why}): {}",
+            reply["text"].as_str().unwrap_or("")
+        );
+    } else {
+        Ok(reply["text"].as_str().unwrap_or("").to_string())
     }
 }
 
@@ -449,4 +546,46 @@ fn test(
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn stop_names_the_speech_model_and_the_cleanup() {
+        let reply = json!({
+            "ok": true, "text": "hi", "chars": 2, "pasted": true, "engine": "parakeet",
+            "cleanup": { "state": "cleaned", "backend": "anthropic:claude-haiku-5-5" },
+        });
+        assert_eq!(
+            stop_line(&reply).unwrap(),
+            "dictated 2 chars · Parakeet TDT 0.6B v3 · cleanup anthropic:claude-haiku-5-5"
+        );
+        let reply = json!({
+            "ok": true, "text": "hi", "chars": 2, "pasted": true, "engine": "whisper",
+            "cleanup": { "state": "refused", "why": "length changed 2.00×" },
+        });
+        assert_eq!(
+            stop_line(&reply).unwrap(),
+            "dictated 2 chars · Whisper large-v3-turbo · raw (cleanup refused: length changed 2.00×)"
+        );
+        let reply = json!({ "ok": true, "text": "hi", "chars": 2, "pasted": true,
+                            "engine": "whisper", "cleanup": { "state": "off" } });
+        assert!(stop_line(&reply).unwrap().ends_with("· raw (cleanup off)"));
+        let reply = json!({ "ok": true, "empty": true, "text": "", "engine": "parakeet" });
+        assert_eq!(
+            stop_line(&reply).unwrap(),
+            "no speech heard · Parakeet TDT 0.6B v3"
+        );
+    }
+
+    #[test]
+    fn a_reply_from_an_older_daemon_still_reads() {
+        let reply = json!({ "ok": true, "text": "hi", "chars": 2, "pasted": true });
+        assert_eq!(stop_line(&reply).unwrap(), "dictated 2 chars");
+        let reply = json!({ "ok": true, "text": "hi", "pasted": false, "paste_error": "gone" });
+        assert!(stop_line(&reply).is_err());
+    }
 }
