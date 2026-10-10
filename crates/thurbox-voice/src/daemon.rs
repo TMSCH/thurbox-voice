@@ -109,6 +109,8 @@ struct Daemon {
     loading: Option<std::thread::JoinHandle<()>>,
     /// What the last `stop` is doing, for `status`.
     busy: Option<&'static str>,
+    /// Our socket's [`identity`], so `quit` removes only our own.
+    bound: (u64, u64),
 }
 
 pub fn serve(root: &Path, config: Config) -> Result<()> {
@@ -135,6 +137,7 @@ pub fn serve(root: &Path, config: Config) -> Result<()> {
         warm: Arc::new(Mutex::new(None)),
         loading: None,
         busy: None,
+        bound,
     };
     let mut last = Instant::now();
     loop {
@@ -169,17 +172,21 @@ pub fn serve(root: &Path, config: Config) -> Result<()> {
     }
     daemon.unload();
     // Only our own: a socket another daemon bound at this path is its, alive.
-    if std::fs::metadata(&socket).is_ok_and(|meta| identity(&meta) == bound) {
-        std::fs::remove_file(&socket).ok();
-    }
+    remove_own(&socket, bound);
     Ok(())
 }
 
-/// What tells our socket file from another bound later at the same path. The
-/// inode alone can be handed straight back out once freed (ext4 does), so the
-/// device and the change time go with it.
-fn identity(meta: &std::fs::Metadata) -> (u64, u64, i64, i64) {
-    (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec())
+/// What tells our socket file from another bound later at the same path:
+/// fixed for the file's life, whatever is done to its permissions or times.
+fn identity(meta: &std::fs::Metadata) -> (u64, u64) {
+    (meta.dev(), meta.ino())
+}
+
+/// Remove the socket at `path` only if it is still the one bound as `bound`.
+fn remove_own(path: &Path, bound: (u64, u64)) {
+    if std::fs::metadata(path).is_ok_and(|meta| identity(&meta) == bound) {
+        std::fs::remove_file(path).ok();
+    }
 }
 
 impl Daemon {
@@ -210,7 +217,7 @@ impl Daemon {
             "quit" => {
                 self.recording = None;
                 self.unload();
-                std::fs::remove_file(socket_path(&self.root)).ok();
+                remove_own(&socket_path(&self.root), self.bound);
                 std::process::exit(0);
             }
             other => bail!("unknown request {other:?}"),
