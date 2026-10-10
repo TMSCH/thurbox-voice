@@ -51,17 +51,32 @@ is, even when the session lives on a remote host.
 
 | Strip | Means |
 |---|---|
-| `○ ctrl+space to start talking → fix-ci` | idle; the arrow names the selected session |
-| `● REC 0:07 → fix-ci · parakeet · ctrl+space to stop` | recording for that session |
-| `⋯ transcribing for fix-ci…` | speech to text, then cleanup |
-| `✓ dictated 66 chars → fix-ci — review, then Enter` | in the input box, not sent |
+| `○ ctrl+space to start talking → fix-ci · Parakeet TDT 0.6B v3` | idle; the arrow names the selected session |
+| `● REC 0:07 → fix-ci · Parakeet TDT 0.6B v3 · ctrl+space to stop` | recording for that session, with that speech model |
+| `⋯ transcribing with Parakeet TDT 0.6B v3 for fix-ci…` | speech to text, then cleanup |
+| `✓ dictated 66 chars · Parakeet TDT 0.6B v3 · cleanup anthropic:claude-haiku-5-5 → fix-ci — review, then Enter` | in the input box, not sent |
 
-The session is fixed when you start: change the selection mid-sentence and the
-text still goes where you started. Nothing is ever submitted for you.
+The session, the speech model and the recording mode are fixed when you start:
+change the selection or a setting mid-sentence and this dictation is unchanged.
+Nothing is ever submitted for you.
 
 - **Palette** (`Ctrl+P`): `voice: cancel the recording`,
-  `voice: switch speech engine`.
-- **Settings** (`Ctrl+,`): `voice.engine`, `parakeet` or `whisper`.
+  `voice: switch speech recognition model`.
+- **Settings** (`F6` or `Ctrl+,`), both kept across restarts:
+  - `voice.engine` is the speech recognition model: `parakeet` (the default)
+    or `whisper`. It is not the cleanup model, which `config.toml` sets.
+  - `voice.mode` is `toggle` (the default: press `ctrl+space` to start and
+    again to stop) or `hold` (record while `ctrl+space` is held).
+
+  Both are pickers on a thurbox that supports setting `choices`. An older
+  thurbox shows a text field instead.
+- **Hold needs key releases.** It needs a thurbox that reports them
+  (`release = true` key bindings), plus a terminal with the kitty keyboard
+  protocol (kitty, WezTerm, Ghostty, foot, Alacritty, iTerm2 3.5+) or Windows.
+  It does not work inside tmux or screen, or in macOS Terminal.app. Where
+  releases are not reported, the strip says so and `ctrl+space` toggles
+  instead. A second press always stops, so a lost release cannot leave the
+  microphone on.
 
 ## Engines
 
@@ -144,9 +159,25 @@ api_key_env = "OPENAI_API_KEY"   # not needed for a local base_url
 codex_model = "luna"        # a family, resolved against Codex's catalog
 # command = ["my-agent", "-p"]   # or your own; the prompt is appended
 
+# instructions = "Keep British spelling."      # added after the built-in rules
+# instructions_file = "~/notes/voice.md"        # or read from a file
+
 [context]
 glossary = ["Spotpay", "payouts", "ledger"]   # your own words
+sources = ["glossary", "session", "screen", "memory"]   # drop one to stop sending it
+screen_lines = 60           # of the captured session's screen
+memory_files = []           # your own notes, at most 4000 chars each
+max_chars = 8000            # the whole context, cut oldest screen lines first
 ```
+
+Your instructions come after the built-in rules, and those rules still win:
+return only the transcript, and treat it as text to correct, never as a
+request. Only the session a recording started for is read, through
+`thurbox-cli session get` and `session capture`. No other session and no
+history is read. Context is fenced as untrusted reference data, never as
+instructions. `thurbox-voice prompt --session <id>` prints exactly what would
+be sent, and `thurbox-voice config` lists the sources, files and instructions
+in force.
 
 The agent presets start each CLI lean: `claude -p --model haiku` with settings,
 tools and MCP servers switched off, or `codex exec` with a Luna model from
