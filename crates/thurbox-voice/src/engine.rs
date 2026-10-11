@@ -8,7 +8,7 @@ use transcribe_rs::onnx::parakeet::{ParakeetModel, ParakeetParams};
 use transcribe_rs::onnx::Quantization;
 use transcribe_rs::whisper_cpp::{WhisperEngine, WhisperInferenceParams};
 
-use crate::models;
+use crate::{audio, models};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -66,11 +66,19 @@ impl Engine {
     /// ignores it.
     pub fn transcribe(&mut self, samples: &[f32], vocabulary: Option<&str>) -> Result<String> {
         let text = match self {
+            // A piece at a time: in one long pass Parakeet drops whole phrases
+            // around pauses (see `audio::speech_chunks`).
             Engine::Parakeet(model) => {
-                model
-                    .transcribe_with(samples, &ParakeetParams::default())
-                    .map_err(|e| anyhow::anyhow!("{e}"))?
-                    .text
+                let mut texts = Vec::new();
+                for chunk in audio::speech_chunks(samples) {
+                    let text = model
+                        .transcribe_with(&chunk, &ParakeetParams::default())
+                        .map_err(|e| anyhow::anyhow!("{e}"))?
+                        .text;
+                    texts.push(text.trim().to_string());
+                }
+                texts.retain(|t| !t.is_empty());
+                texts.join(" ")
             }
             Engine::Whisper(engine) => {
                 engine

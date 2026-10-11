@@ -234,16 +234,80 @@ const PAD: usize = 8 * FRAME;
 /// Trim leading and trailing silence. `None` when there is no speech at all,
 /// which is the case Whisper fills with "Thank you." — better to say nothing.
 pub fn trim_silence(samples: &[f32]) -> Option<&[f32]> {
-    let loud = |chunk: &[f32]| {
-        let rms = (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len() as f32).sqrt();
-        rms > GATE
-    };
+    let loud = |chunk: &[f32]| rms(chunk) > GATE;
     let frames: Vec<&[f32]> = samples.chunks(FRAME).collect();
     let first = frames.iter().position(|f| loud(f))?;
     let last = frames.iter().rposition(|f| loud(f))?;
     let start = (first * FRAME).saturating_sub(PAD);
     let end = ((last + 1) * FRAME + PAD).min(samples.len());
     Some(&samples[start..end])
+}
+
+/// A quiet stretch at least this long ends a stretch of speech: 0.6 s, longer
+/// than the gaps between words, as long as a breath between sentences.
+const PAUSE: usize = 20;
+/// Most speech one chunk holds, 20 s. Speech run together for longer is cut
+/// at its quietest frame between `MAX_CHUNK / 2` and `MAX_CHUNK`.
+const MAX_CHUNK: usize = 20 * RATE as usize;
+
+/// `speech` split into the pieces to transcribe one at a time: the stretches
+/// of speech between pauses, each with [`PAD`] either side, packed into
+/// chunks of at most [`MAX_CHUNK`] with the pauses between them shortened to
+/// their padding.
+///
+/// Why: Parakeet decoding a long clip in one pass silently drops whole
+/// phrases around a long pause, which is how a minute of thinking aloud lost
+/// its second half. The same audio cut at its pauses comes back whole.
+pub fn speech_chunks(speech: &[f32]) -> Vec<Vec<f32>> {
+    let loud: Vec<bool> = speech.chunks(FRAME).map(|f| rms(f) > GATE).collect();
+    // Stretches of speech, as frame ranges, split at every long pause.
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut quiet = PAUSE;
+    for (i, &is_loud) in loud.iter().enumerate() {
+        if is_loud {
+            match runs.last_mut() {
+                Some(run) if quiet < PAUSE => run.1 = i + 1,
+                _ => runs.push((i, i + 1)),
+            }
+            quiet = 0;
+        } else {
+            quiet += 1;
+        }
+    }
+    let mut pieces: Vec<&[f32]> = Vec::new();
+    for (first, end) in runs {
+        let start = (first * FRAME).saturating_sub(PAD);
+        let end = (end * FRAME + PAD).min(speech.len());
+        let mut piece = &speech[start..end];
+        while piece.len() > MAX_CHUNK {
+            let cut = quietest(piece, MAX_CHUNK / 2, MAX_CHUNK);
+            pieces.push(&piece[..cut]);
+            piece = &piece[cut..];
+        }
+        pieces.push(piece);
+    }
+    let mut chunks: Vec<Vec<f32>> = Vec::new();
+    for piece in pieces {
+        match chunks.last_mut() {
+            Some(chunk) if chunk.len() + piece.len() <= MAX_CHUNK => chunk.extend_from_slice(piece),
+            _ => chunks.push(piece.to_vec()),
+        }
+    }
+    chunks
+}
+
+fn rms(chunk: &[f32]) -> f32 {
+    (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len().max(1) as f32).sqrt()
+}
+
+/// The end of the quietest frame of `samples` between `from` and `to`.
+fn quietest(samples: &[f32], from: usize, to: usize) -> usize {
+    (from / FRAME..to.min(samples.len()) / FRAME)
+        .min_by(|&a, &b| {
+            let at = |i: usize| rms(&samples[i * FRAME..(i + 1) * FRAME]);
+            at(a).total_cmp(&at(b))
+        })
+        .map_or(to, |i| (i + 1) * FRAME)
 }
 
 #[cfg(test)]
@@ -269,6 +333,54 @@ mod tests {
         let kept = trim_silence(&clip).unwrap();
         assert!(kept.len() >= RATE as usize / 2);
         assert!(kept.len() <= RATE as usize / 2 + 2 * PAD + 2 * FRAME);
+    }
+
+    #[test]
+    fn a_long_pause_is_cut_short_and_no_speech_is_lost() {
+        let second = RATE as usize;
+        let mut clip = tone(5 * second, 0.3);
+        clip.extend(vec![0.0; 15 * second]);
+        clip.extend(tone(6 * second, 0.2));
+        let chunks = speech_chunks(&clip);
+        // Both stretches fit one chunk, with the 15 s pause down to padding.
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].len() <= 11 * second + 4 * PAD + 2 * FRAME);
+        let loud = |s: &[f32]| s.iter().filter(|x| x.abs() > 0.1).count();
+        assert_eq!(loud(&chunks[0]), loud(&clip));
+    }
+
+    #[test]
+    fn a_long_dictation_is_split_and_kept_whole() {
+        // Two minutes of speech in 9 s sentences with short breaths between.
+        let second = RATE as usize;
+        let mut clip = Vec::new();
+        for _ in 0..13 {
+            clip.extend(tone(9 * second, 0.3));
+            clip.extend(vec![0.0; second]);
+        }
+        let chunks = speech_chunks(&clip);
+        assert!(chunks.len() >= 6, "{} chunks", chunks.len());
+        assert!(chunks.iter().all(|c| c.len() <= MAX_CHUNK));
+        let loud = |s: &[f32]| s.iter().filter(|x| x.abs() > 0.1).count();
+        let kept: usize = chunks.iter().map(|c| loud(c)).sum();
+        assert_eq!(kept, loud(&clip));
+    }
+
+    #[test]
+    fn speech_with_no_pause_is_cut_at_its_quietest_point() {
+        let second = RATE as usize;
+        let mut clip = tone(14 * second, 0.3);
+        clip.extend(tone(FRAME, 0.02));
+        clip.extend(tone(14 * second, 0.3));
+        let chunks = speech_chunks(&clip);
+        assert_eq!(chunks.len(), 2);
+        let quiet = 14 * second..14 * second + FRAME;
+        assert!(
+            chunks[0].len().abs_diff(quiet.end) <= FRAME,
+            "cut at {}",
+            chunks[0].len()
+        );
+        assert_eq!(chunks.iter().map(Vec::len).sum::<usize>(), clip.len());
     }
 
     #[test]
