@@ -561,7 +561,161 @@ pub fn guard(raw: &str, cleaned: &str) -> Option<String> {
     if kept < floor {
         return Some(format!("only {:.0}% of the words survived", kept * 100.0));
     }
+    // The checks above pass a cleanup that keeps the first half and stops:
+    // half the length is within bounds, and the words it kept are most of
+    // the vocabulary. So count what was *said* — the content words, in order
+    // — and look at the end on its own, where a model that stops early, or
+    // drops a "fragment" that was really a second request, loses them.
+    let said = content_words(&fluent);
+    if said.len() >= MIN_CONTENT {
+        let kept = kept_in_order(&said, &content_words(cleaned));
+        let share = |kept: &[bool]| kept.iter().filter(|&&k| k).count() as f64 / kept.len() as f64;
+        let all = share(&kept);
+        if all < MIN_CONTENT_KEPT {
+            return Some(format!(
+                "only {:.0}% of the content words survived",
+                all * 100.0
+            ));
+        }
+        let closing = share(&kept[kept.len() - (kept.len() / 5).max(CLOSING_MIN)..]);
+        if closing < MIN_CLOSING_KEPT {
+            return Some(format!(
+                "only {:.0}% of the closing content words survived",
+                closing * 100.0
+            ));
+        }
+    }
     None
+}
+
+/// Below this many content words there is too little to judge by.
+const MIN_CONTENT: usize = 9;
+/// Share of the content words a cleanup must keep in order. Fillers and
+/// hedges are not content words, so what a faithful cleanup loses is the few
+/// misheard words it corrects ("item potency" → "idempotency"); on 48 real
+/// dictations the lowest share kept was well above this.
+const MIN_CONTENT_KEPT: f64 = 0.65;
+/// The same, for the closing fifth of the content words (at least
+/// [`CLOSING_MIN`] of them), where a model that stops early loses all of
+/// them: cutting real cleanups to their first half to three quarters, this
+/// and the overall share refused 86 of 90.
+const MIN_CLOSING_KEPT: f64 = 0.5;
+const CLOSING_MIN: usize = 5;
+
+/// Words a cleanup may drop without losing anything: short words, and the
+/// spoken hedges and fillers the prompt tells it to remove.
+const DROPPABLE: &[&str] = &[
+    "about",
+    "actually",
+    "also",
+    "anyway",
+    "basically",
+    "been",
+    "being",
+    "could",
+    "does",
+    "doing",
+    "done",
+    "from",
+    "gonna",
+    "guess",
+    "have",
+    "honestly",
+    "into",
+    "just",
+    "kind",
+    "kinda",
+    "know",
+    "like",
+    "literally",
+    "maybe",
+    "mean",
+    "okay",
+    "only",
+    "pretty",
+    "probably",
+    "really",
+    "right",
+    "some",
+    "something",
+    "sort",
+    "sorry",
+    "stuff",
+    "sure",
+    "that",
+    "their",
+    "them",
+    "then",
+    "there",
+    "these",
+    "they",
+    "thing",
+    "things",
+    "think",
+    "this",
+    "those",
+    "wait",
+    "wanna",
+    "want",
+    "well",
+    "were",
+    "what",
+    "when",
+    "which",
+    "will",
+    "with",
+    "would",
+    "yeah",
+    "your",
+];
+
+/// The words of `text` that carry its meaning, in order, repeats kept.
+fn content_words(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .map(str::to_lowercase)
+        .filter(|w| w.chars().count() >= 4 && !DROPPABLE.contains(&w.as_str()))
+        .collect()
+}
+
+/// A word's first five letters, so "configurable" matches "configured" and a
+/// plural its singular.
+fn stem(word: &str) -> &str {
+    word.char_indices()
+        .nth(5)
+        .map_or(word, |(at, _)| &word[..at])
+}
+
+/// For each word of `said`, whether `cleaned` still has it in the same
+/// order: the longest common subsequence of the two, by [`stem`]. In order,
+/// so a word said at the end is not counted as kept because the same word
+/// was also said earlier — "thurbox" in the first sentence does not vouch
+/// for the "thurbox" in a dropped last one.
+fn kept_in_order(said: &[String], cleaned: &[String]) -> Vec<bool> {
+    let (n, m) = (said.len(), cleaned.len());
+    // longest[i][j]: the LCS of said[i..] and cleaned[j..].
+    let mut longest = vec![vec![0u32; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            longest[i][j] = if stem(&said[i]) == stem(&cleaned[j]) {
+                longest[i + 1][j + 1] + 1
+            } else {
+                longest[i + 1][j].max(longest[i][j + 1])
+            };
+        }
+    }
+    let mut kept = vec![false; n];
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if stem(&said[i]) == stem(&cleaned[j]) {
+            kept[i] = true;
+            (i, j) = (i + 1, j + 1);
+        } else if longest[i + 1][j] >= longest[i][j + 1] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    kept
 }
 
 #[cfg(test)]
@@ -656,6 +810,71 @@ mod tests {
                        investigate something, and have you pick the right role. That's the \
                        angle, however you do it.";
         assert_eq!(guard(raw, cleaned), None);
+    }
+
+    /// A long dictation whose second half is a separate request, in the
+    /// shape of the ones that lost it.
+    const TWO_REQUESTS: &str = "Okay, um, so I think we need a few PRs on fleet. The first \
+        one is the shepherd should send plain review comments to the session, it shouldn't \
+        wait for review requests, and the interval should be configurable. Uh, the second is \
+        when fleet starts it should pick up the open sessions in thurbox and shepherd them, \
+        even the ones created outside of fleet. Um, and yeah, separately, I want you to \
+        create a new GitHub repo called Vega that sets up a Hermes agent with a Terraform \
+        template for the OVH server. I think what I've done for my personal agent is a good \
+        starting point, so reuse that setup, keep the secrets out of the repo, and write a \
+        README on how to deploy it from scratch.";
+
+    #[test]
+    fn a_cleanup_that_keeps_both_requests_passes() {
+        let cleaned = "Okay, I think we need a few PRs on fleet. The first one is the shepherd \
+            should send plain review comments to the session; it shouldn't wait for review \
+            requests, and the interval should be configurable. The second is when fleet \
+            starts, it should pick up the open sessions in thurbox and shepherd them, even \
+            the ones created outside of fleet. Separately, I want you to create a new GitHub \
+            repo called Vega that sets up a Hermes agent with a Terraform template for the \
+            OVH server. I think what I've done for my personal agent is a good starting \
+            point, so reuse that setup, keep the secrets out of the repo, and write a README \
+            on how to deploy it from scratch.";
+        assert_eq!(guard(TWO_REQUESTS, cleaned), None);
+    }
+
+    #[test]
+    fn a_cleanup_that_drops_the_second_request_is_refused() {
+        // Stops after the first request: over half the length, and most of
+        // the vocabulary, so only the content-word check catches it.
+        let first_half = "Okay, I think we need a few PRs on fleet. The first one is the \
+            shepherd should send plain review comments to the session; it shouldn't wait for \
+            review requests, and the interval should be configurable. The second is when fleet \
+            starts, it should pick up the open sessions in thurbox and shepherd them, even the \
+            ones created outside of fleet.";
+        let why = guard(TWO_REQUESTS, first_half).expect("refused");
+        assert!(why.contains("content words"), "{why}");
+        // Stops mid-way through the second request, like the cut-off one.
+        let cut = "Okay, I think we need a few PRs on fleet. The first one is the shepherd \
+            should send plain review comments to the session; it shouldn't wait for review \
+            requests, and the interval should be configurable. The second is when fleet \
+            starts, it should pick up the open sessions in thurbox and shepherd them, even \
+            the ones created outside of fleet. Separately, I want you to create a new GitHub \
+            repo called Vega that sets up a Hermes agent with a Terraform template for the \
+            OVH server. I think what I've done for my personal agent...";
+        assert!(guard(TWO_REQUESTS, cut).is_some());
+    }
+
+    #[test]
+    fn a_word_said_twice_does_not_vouch_for_its_second_time() {
+        let said: Vec<String> = ["fleet", "shepherd", "sessions", "fleet", "thurbox"]
+            .map(String::from)
+            .to_vec();
+        let cleaned: Vec<String> = ["fleet", "shepherd", "sessions"].map(String::from).to_vec();
+        assert_eq!(
+            kept_in_order(&said, &cleaned),
+            [true, true, true, false, false]
+        );
+        // Five letters of stem: a corrected ending still counts.
+        assert_eq!(
+            kept_in_order(&["configurable".into()], &["configured".into()]),
+            [true]
+        );
     }
 
     #[test]
