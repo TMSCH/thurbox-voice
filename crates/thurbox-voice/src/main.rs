@@ -157,6 +157,9 @@ impl Plan {
             raw,
         )?;
         eprintln!("[cleanup] {} · {:.2}s", cleaned.backend, cleaned.secs);
+        if let Some(echo) = &cleaned.echo {
+            eprintln!("[cleanup] echoed its prompt, cut: {echo}");
+        }
         if let Some(why) = &cleaned.rejected {
             eprintln!("[cleanup] ignored ({why}) — keeping the raw transcript. Model said:");
             eprintln!("{}", cleaned.model_output);

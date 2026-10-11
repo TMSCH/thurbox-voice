@@ -371,6 +371,9 @@ impl Daemon {
                             .map(|r| format!(" (rejected: {r})"))
                             .unwrap_or_default()
                     );
+                    if let Some(echo) = &cleaned.echo {
+                        eprintln!("[daemon] cleanup echoed its prompt, cut: {echo}");
+                    }
                     text = cleaned.text;
                     cleanup_log = Some(stats::CleanupLog {
                         backend: cleaned.backend,
