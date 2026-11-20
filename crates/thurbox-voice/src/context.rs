@@ -8,13 +8,13 @@
 
 use std::process::Command;
 
-use serde_json::Value;
+use crate::fleet;
 
 /// Always in play when dictating to a coding agent inside thurbox. Product and
 /// tool names a speech model has rarely or never heard.
 const BUILTIN: &[&str] = &[
     "thurbox",
-    "thurbox-cli",
+    "Fleet",
     "thurbox-voice",
     "tmux",
     "worktree",
@@ -54,38 +54,42 @@ pub struct Context {
 }
 
 /// Build the context for a dictation into `session` (when there is one).
-/// Every lookup is best-effort: a session thurbox cannot describe, or a remote
-/// one whose screen is not capturable here, just contributes less.
-pub fn build(glossary: &[String], session: Option<&str>) -> Context {
+/// Every lookup is best-effort: a Task Fleet cannot describe, or a session
+/// whose screen is not capturable here, just contributes less.
+pub fn build(glossary: &[String], session: Option<&fleet::Session>) -> Context {
     let mut words: Vec<String> = BUILTIN.iter().map(|w| w.to_string()).collect();
     words.extend(glossary.iter().cloned());
 
     let mut text = String::new();
     let mut agent = None;
-    if let Some(id) = session {
-        if let Some(info) = thurbox_json(&["session", "get", id, "--json", "--no-verify"]) {
-            let field = |k: &str| info[k].as_str().map(str::to_string);
-            agent = field("agent");
-            text.push_str("Dictating to a coding-agent session in thurbox.\n");
-            if let Some(name) = field("name") {
-                text.push_str(&format!("Session: {name}\n"));
-                words.push(name);
-            }
-            if let Some(agent) = &agent {
-                text.push_str(&format!("Agent: {agent}\n"));
-            }
-            for tree in info["worktrees"].as_array().into_iter().flatten() {
-                let repo = tree["repo_path"].as_str().unwrap_or_default();
-                let repo_name = repo.rsplit('/').next().unwrap_or(repo);
-                let branch = tree["branch"].as_str().unwrap_or_default();
-                text.push_str(&format!("Repo: {repo_name} (branch {branch})\n"));
-                words.push(repo_name.to_string());
-                words.push(branch.to_string());
-            }
+    if let Some(session) = session {
+        let status = &session.task_json["status"];
+        // The harness (`claude-coder`, `codex`, …) names the agent's family.
+        agent = status["execution"]["harness"]
+            .as_str()
+            .or_else(|| session.task_json["spec"]["harness"].as_str())
+            .map(str::to_string);
+        text.push_str("Dictating to a coding-agent session in thurbox.\n");
+        text.push_str(&format!("Session: {}\n", session.task));
+        words.push(session.task.clone());
+        if let Some(agent) = &agent {
+            text.push_str(&format!("Agent: {agent}\n"));
         }
-        if let Some(screen) = screen(id) {
+        for dir in status["workspace"]["dirs"].as_array().into_iter().flatten() {
+            let Some(dir) = dir.as_str() else { continue };
+            let repo = dir.rsplit('/').next().unwrap_or(dir).to_string();
+            match branch(dir) {
+                Some(branch) => {
+                    text.push_str(&format!("Repo: {repo} (branch {branch})\n"));
+                    words.push(branch);
+                }
+                None => text.push_str(&format!("Repo: {repo}\n")),
+            }
+            words.push(repo);
+        }
+        if let Some(raw) = session.screen(SCREEN_LINES) {
             text.push_str("\nThe agent's screen, most recent last:\n");
-            text.push_str(&screen);
+            text.push_str(&tail(&raw, SCREEN_LINES, SCREEN_CHARS));
             text.push('\n');
         }
     }
@@ -101,27 +105,13 @@ pub fn build(glossary: &[String], session: Option<&str>) -> Context {
     }
 }
 
-fn thurbox_json(args: &[&str]) -> Option<Value> {
-    let output = Command::new("thurbox-cli").args(args).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    serde_json::from_slice(&output.stdout).ok()
-}
-
-/// The last non-blank lines of the session's screen. A TUI pads its screen
-/// with blank and space-only lines; they are noise to the model.
-fn screen(id: &str) -> Option<String> {
-    let capture = thurbox_json(&[
-        "session",
-        "capture",
-        id,
-        "--lines",
-        &SCREEN_LINES.to_string(),
-        "--json",
-    ])?;
-    let raw = capture["output"].as_str()?;
-    Some(tail(raw, SCREEN_LINES, SCREEN_CHARS))
+fn branch(dir: &str) -> Option<String> {
+    let output = Command::new("git")
+        .args(["-C", dir, "branch", "--show-current"])
+        .output()
+        .ok()?;
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (output.status.success() && !branch.is_empty()).then_some(branch)
 }
 
 fn tail(raw: &str, lines: usize, chars: usize) -> String {

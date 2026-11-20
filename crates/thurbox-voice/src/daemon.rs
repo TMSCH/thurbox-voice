@@ -7,8 +7,8 @@
 //! is how the model's memory is given back.
 //!
 //! On `stop` the daemon does the whole rest of the job itself — transcribe,
-//! clean up, paste into the session through `thurbox-cli session send
-//! --no-enter --force` — so the pane that asked only needs the summary.
+//! clean up, type into the session's composer through runtime-mux (see
+//! `fleet`) — so the pane that asked only needs the summary.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -25,6 +25,7 @@ use crate::cleanup;
 use crate::config::Config;
 use crate::context;
 use crate::engine::{Engine, EngineId};
+use crate::fleet;
 use crate::models;
 use crate::stats;
 
@@ -336,7 +337,14 @@ impl Daemon {
             let _ = loading.join();
         }
         let load_s = load_wait.elapsed().as_secs_f64();
-        let ctx = context::build(&self.config.context.glossary, session);
+        let target = session.map(fleet::resolve);
+        if let Some(Err(e)) = &target {
+            eprintln!("[daemon] session {}: {e:#}", session.unwrap_or_default());
+        }
+        let ctx = context::build(
+            &self.config.context.glossary,
+            target.as_ref().and_then(|t| t.as_ref().ok()),
+        );
 
         let started = Instant::now();
         let raw = {
@@ -390,10 +398,17 @@ impl Daemon {
             }
         }
 
-        let pasted = match (session, text.is_empty()) {
-            (Some(session), false) => Some(paste(session, &text)),
+        let pasted = match (target, text.is_empty()) {
+            (Some(target), false) => Some(target.and_then(|t| t.type_text(&text))),
             _ => None,
         };
+        if let Some(Err(e)) = &pasted {
+            // The text is kept in compare.jsonl; say so where it is looked for.
+            eprintln!(
+                "[daemon] paste failed, the text is in {}: {e:#}",
+                stats::path(&self.root).display()
+            );
+        }
 
         stats::append(
             &self.root,
@@ -432,21 +447,4 @@ impl Daemon {
         }
         Ok(reply)
     }
-}
-
-/// Into the session's composer, not submitted. `--force` types even when the
-/// user has already started a line, so a dictation can finish a sentence.
-fn paste(session: &str, text: &str) -> Result<()> {
-    let output = Command::new("thurbox-cli")
-        .args(["session", "send", session, text, "--no-enter", "--force"])
-        .stdin(Stdio::null())
-        .output()
-        .context("run thurbox-cli")?;
-    if !output.status.success() {
-        bail!(
-            "thurbox-cli session send: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(())
 }
