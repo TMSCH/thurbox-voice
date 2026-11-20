@@ -12,6 +12,7 @@ mod config;
 mod context;
 mod daemon;
 mod engine;
+mod fleet;
 mod models;
 mod stats;
 

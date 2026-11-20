@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -42,18 +42,23 @@ pub struct CleanupLog {
     pub model_output: Option<String>,
 }
 
+/// Where every transcription is kept, pasted or not.
+pub fn path(root: &Path) -> PathBuf {
+    root.join("compare.jsonl")
+}
+
 pub fn append(root: &Path, entry: &Entry) -> Result<()> {
     fs::create_dir_all(root)?;
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(root.join("compare.jsonl"))?;
+        .open(path(root))?;
     writeln!(file, "{}", serde_json::to_string(entry)?)?;
     Ok(())
 }
 
 pub fn print(root: &Path) -> Result<()> {
-    let path = root.join("compare.jsonl");
+    let path = path(root);
     let Ok(body) = fs::read_to_string(&path) else {
         println!("no transcriptions logged yet ({})", path.display());
         return Ok(());

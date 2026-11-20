@@ -82,7 +82,7 @@ flowchart LR
     mic[microphone] --> stt["speech to text<br/>Parakeet or Whisper"]
     stt --> cleanup{{"cleanup pass<br/>on by default"}}
     ctx["context: word lists, session name,<br/>repo, branch, agent, last ~60 screen lines"] --> cleanup
-    cleanup --> send["thurbox-cli session send --no-enter"]
+    cleanup --> send["runtime-mux input, not submitted"]
     stt -. "--raw, or cleanup off" .-> send
     subgraph local [always on your machine]
         mic
@@ -152,8 +152,8 @@ The agent presets start each CLI lean: `claude -p --model haiku` with settings,
 tools and MCP servers switched off, or `codex exec` with a Luna model from
 Codex's catalog at low effort. Context is a built-in word list (`thurbox`,
 `tmux`, `worktree`, `Claude Code`, `nextest`, …), your glossary, and the target
-session as `thurbox-cli` reports it. Whisper is also primed with the word
-lists.
+session as Fleet reports it (its Task, harness, repo, branch and screen).
+Whisper is also primed with the word lists.
 
 ## Behind the key
 
